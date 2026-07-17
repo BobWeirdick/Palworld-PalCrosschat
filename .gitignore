@@ -1,0 +1,28 @@
+# Build
+/build/
+/out/
+/cmake-build-*/
+/.vs/
+/*.user
+/CMakeUserPresets.json
+
+# IDE
+/.idea/
+/.vscode/
+*.suo
+*.sdf
+
+# Dist binary (keep layout files)
+/dist/PalCrosschat/dlls/*.dll
+/dist/PalCrosschat/dlls/*.pdb
+/dist/PalCrosschat/dlls/*.exp
+/dist/PalCrosschat/dlls/*.lib
+/dist/PalCrosschat/dlls/*.ilk
+/dist/PalCrosschat/config.json
+
+# Local config secrets
+/config/config.json
+
+# OS
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,23 @@
+{
+  "General": {
+    "ServerOrigin": "pal-na",
+    "PollIntervalMs": 750,
+    "MaxBatch": 50,
+    "MaxBroadcastsPerTick": 5,
+    "DebugVerbose": false
+  },
+  "MySQL": {
+    "Host": "127.0.0.1",
+    "Port": 3306,
+    "User": "crosschat",
+    "Password": "CHANGE_ME",
+    "Database": "crosschat",
+    "ReconnectBackoffMaxSec": 30
+  },
+  "Format": {
+    "PrefixNA": "[NA]",
+    "PrefixEU": "[EU]",
+    "PrefixDiscord": "[Discord]",
+    "InjectCategory": "global"
+  }
+}
