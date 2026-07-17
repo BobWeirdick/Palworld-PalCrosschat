@@ -28,6 +28,12 @@ namespace PalCrosschat
         std::string message;
     };
 
+    struct WebhookJob
+    {
+        std::string webhook_url;
+        std::string content;
+    };
+
     template <typename T>
     class BoundedQueue
     {
@@ -92,4 +98,5 @@ namespace PalCrosschat
 
     using OutboundQueue = BoundedQueue<OutboundMessage>;
     using InboundQueue = BoundedQueue<InboundMessage>;
+    using WebhookQueue = BoundedQueue<WebhookJob>;
 }

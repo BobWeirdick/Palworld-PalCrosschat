@@ -32,6 +32,11 @@ namespace PalCrosschat
         // InjectCategory: "global" -> 1, "discord" -> 4
         uint8_t inject_category = 1;
         std::string inject_category_name = "global";
+
+        // WordBlacklist — each BlockedWords entry is a regex (ECMAScript).
+        std::vector<std::string> blocked_words;
+        int auto_mute_minutes = 5;
+        std::string mute_log_webhook;
     };
 
     // Loads Mods/PalCrosschat/config.json (mod root next to dlls/).

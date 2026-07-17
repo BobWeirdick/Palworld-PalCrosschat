@@ -95,8 +95,15 @@ cmake --build build --config Game__Shipping__Win64
 | PrefixEU | Format | `[EU]` | Prefix for messages originating from pal-eu. |
 | PrefixDiscord | Format | `[Discord]` | Prefix for Discord-origin messages. |
 | InjectCategory | Format | `global` | `global` (1) or `discord` (4). |
+| BlockedWords | WordBlacklist | `[]` | Regex patterns (ECMAScript). Matching chat is suppressed and not relayed. Invalid patterns are skipped with a warning. |
+| AutoMuteMinutes | WordBlacklist | `5` | After a blacklist hit, block that player's chat for N minutes. `0` = block the matching message only (no timed mute). |
+| MuteLogWebhook | WordBlacklist | `""` | Optional Discord webhook URL for mute/block logs. Empty disables. |
 
 If `config.json` is missing, MySQL fields are empty, or `ServerOrigin` is invalid, the mod logs an error and disables itself. The game server keeps running.
+
+### WordBlacklist
+
+Each `BlockedWords` entry is compiled as an ECMAScript regex and tested with `regex_search` against sanitized chat text. On a hit the message is cleared in the `EnterChat_Receive` pre-hook (so it never broadcasts or relays), the sender is auto-muted for `AutoMuteMinutes` when that value is > 0, and an optional Discord webhook is posted asynchronously. While muted, further chat from that player is dropped silently.
 
 ## Database contract
 

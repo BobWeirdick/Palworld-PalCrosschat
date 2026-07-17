@@ -65,6 +65,8 @@ add_library(${TARGET} SHARED
     src/DbWorker.cpp
     src/ChatCapture.cpp
     src/ChatInject.cpp
+    src/WordFilter.cpp
+    src/Webhook.cpp
 )
 
 target_include_directories(${TARGET} PRIVATE
@@ -80,6 +82,7 @@ target_link_libraries(${TARGET} PUBLIC UE4SS)
 target_link_libraries(${TARGET} PRIVATE
     mariadbclient_imported
     ws2_32
+    winhttp
     secur32
     crypt32
     shlwapi

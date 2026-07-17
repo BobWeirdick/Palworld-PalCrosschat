@@ -37,11 +37,6 @@ namespace PalCrosschat
             return RC::to_utf8_string(data);
         }
 
-        std::string WideToUtf8(const StringType& str)
-        {
-            return RC::to_utf8_string(str);
-        }
-
         std::string FormatGuid(const FGuid& guid)
         {
             char buf[64]{};
@@ -186,19 +181,48 @@ namespace PalCrosschat
             out_category = params.Category;
             return true;
         }
+
+        void ClearMessageInLocals(UnrealScriptFunctionCallableContext& context)
+        {
+            // Suppress broadcast by emptying Message before EnterChat_Receive runs.
+            UFunction* fn = context.TheStack.Node();
+            void* locals = context.TheStack.Locals();
+            if (!fn || !locals)
+            {
+                return;
+            }
+            if (FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find)))
+            {
+                if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(locals))
+                {
+                    *msg = FString(STR(""));
+                }
+            }
+        }
+
+        std::string TruncateForLog(std::string_view input, size_t max_chars)
+        {
+            if (input.size() <= max_chars)
+            {
+                return std::string(input);
+            }
+            return std::string(input.substr(0, max_chars)) + "...";
+        }
     }
 
-    ChatCapture::ChatCapture(const Config& config, OutboundQueue& outbound)
-        : m_config(config), m_outbound(outbound)
+    ChatCapture::ChatCapture(const Config& config, OutboundQueue& outbound, WebhookWorker* webhook)
+        : m_config(config), m_outbound(outbound), m_webhook(webhook)
     {
+        m_filter = std::make_unique<WordFilter>(config);
     }
 
     bool ChatCapture::Register()
     {
+        // Pre-hook so WordBlacklist can clear Message before the game broadcasts.
         const auto ids = UObjectGlobals::RegisterHook(
             StringType{CAPTURE_HOOK_PATH},
-            UnrealScriptFunctionCallable{}, // empty pre; FirePreCallbacks skips empty
             &ChatCapture::OnEnterChatReceive,
+            UnrealScriptFunctionCallable{},
             this);
 
         m_hook_ids = ids;
@@ -273,13 +297,78 @@ namespace PalCrosschat
         uint8 category = 0;
         ReadHookParams(context, message_fs, category);
 
-        if (!IsRelayedCategory(category))
+        std::string raw_message = FStringToUtf8(message_fs);
+        std::string message = SanitizeMessage(raw_message);
+        if (message.empty())
         {
             return;
         }
 
-        std::string message = SanitizeMessage(FStringToUtf8(message_fs));
-        if (message.empty())
+        UObject* controller = context.Context;
+        UObject* player_state = GetPlayerState(controller);
+        std::string sender_name = SanitizeMessage(ReadPlayerName(player_state), 64);
+        if (sender_name.empty())
+        {
+            sender_name = "Unknown";
+        }
+        std::string sender_id = ReadPlayerUId(controller, player_state);
+        const std::string mute_key = !sender_id.empty() ? sender_id : sender_name;
+
+        if (m_filter && m_filter->Active())
+        {
+            if (m_filter->IsMuted(mute_key))
+            {
+                ClearMessageInLocals(context);
+                if (m_config.debug_verbose)
+                {
+                    Output::send<LogLevel::Normal>(
+                        STR("[PalCrosschat] Dropped chat from muted player {}\n"),
+                        RC::ensure_str(sender_name));
+                }
+                return;
+            }
+
+            if (auto matched = m_filter->FindMatch(message))
+            {
+                ClearMessageInLocals(context);
+                m_filter->Mute(mute_key);
+
+                const int minutes = m_filter->AutoMuteMinutes();
+                Output::send<LogLevel::Warning>(
+                    STR("[PalCrosschat] WordBlacklist hit: player={} id={} mute={}m pattern={} msg={}\n"),
+                    RC::ensure_str(sender_name),
+                    RC::ensure_str(sender_id.empty() ? std::string("-") : sender_id),
+                    minutes,
+                    RC::ensure_str(TruncateForLog(*matched, 80)),
+                    RC::ensure_str(TruncateForLog(message, 120)));
+
+                if (m_webhook && !m_filter->MuteLogWebhook().empty())
+                {
+                    std::string content = "**[PalCrosschat] WordBlacklist**\n";
+                    content += "Server: `" + m_config.server_origin + "`\n";
+                    content += "Player: `" + sender_name + "`";
+                    if (!sender_id.empty())
+                    {
+                        content += " (`" + sender_id + "`)";
+                    }
+                    content += "\n";
+                    if (minutes > 0)
+                    {
+                        content += "Muted: `" + std::to_string(minutes) + "m`\n";
+                    }
+                    else
+                    {
+                        content += "Action: `blocked` (AutoMuteMinutes=0)\n";
+                    }
+                    content += "Pattern: `" + TruncateForLog(*matched, 120) + "`\n";
+                    content += "Message: `" + TruncateForLog(message, 200) + "`";
+                    m_webhook->Enqueue(m_filter->MuteLogWebhook(), std::move(content));
+                }
+                return;
+            }
+        }
+
+        if (!IsRelayedCategory(category))
         {
             return;
         }
@@ -293,15 +382,6 @@ namespace PalCrosschat
         {
             return;
         }
-
-        UObject* controller = context.Context;
-        UObject* player_state = GetPlayerState(controller);
-        std::string sender_name = SanitizeMessage(ReadPlayerName(player_state), 64);
-        if (sender_name.empty())
-        {
-            sender_name = "Unknown";
-        }
-        std::string sender_id = ReadPlayerUId(controller, player_state);
 
         OutboundMessage outbound;
         outbound.sender_name = std::move(sender_name);

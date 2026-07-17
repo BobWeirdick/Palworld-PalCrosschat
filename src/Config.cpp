@@ -153,6 +153,7 @@ namespace PalCrosschat
         const json general = root_json.value("General", json::object());
         const json mysql = root_json.value("MySQL", json::object());
         const json format = root_json.value("Format", json::object());
+        const json blacklist = root_json.value("WordBlacklist", json::object());
 
         cfg.server_origin = GetOr<std::string>(general, "ServerOrigin", "");
         cfg.poll_interval_ms = GetOr<int>(general, "PollIntervalMs", cfg.poll_interval_ms);
@@ -173,6 +174,24 @@ namespace PalCrosschat
         cfg.prefix_eu = GetOr<std::string>(format, "PrefixEU", cfg.prefix_eu);
         cfg.prefix_discord = GetOr<std::string>(format, "PrefixDiscord", cfg.prefix_discord);
         ApplyInjectCategory(cfg, GetOr<std::string>(format, "InjectCategory", "global"));
+
+        cfg.auto_mute_minutes = GetOr<int>(blacklist, "AutoMuteMinutes", cfg.auto_mute_minutes);
+        cfg.mute_log_webhook = GetOr<std::string>(blacklist, "MuteLogWebhook", "");
+        if (blacklist.contains("BlockedWords") && blacklist["BlockedWords"].is_array())
+        {
+            for (const auto& entry : blacklist["BlockedWords"])
+            {
+                if (!entry.is_string())
+                {
+                    continue;
+                }
+                std::string pattern = entry.get<std::string>();
+                if (!pattern.empty())
+                {
+                    cfg.blocked_words.push_back(std::move(pattern));
+                }
+            }
+        }
 
         if (cfg.server_origin != "pal-na" && cfg.server_origin != "pal-eu")
         {
@@ -209,6 +228,10 @@ namespace PalCrosschat
         {
             cfg.mysql_port = 3306;
         }
+        if (cfg.auto_mute_minutes < 0)
+        {
+            cfg.auto_mute_minutes = 0;
+        }
 
         cfg.enabled = true;
         return cfg;
@@ -225,7 +248,8 @@ namespace PalCrosschat
 
         RC::Output::send<RC::LogLevel::Normal>(
             STR("[PalCrosschat] Config: origin={} poll={}ms maxBatch={} maxBroadcasts/tick={} verbose={} "
-                "mysql={}:{} user={} db={} backoffMax={}s injectCategory={} prefixes=[{}|{}|{}]\n"),
+                "mysql={}:{} user={} db={} backoffMax={}s injectCategory={} prefixes=[{}|{}|{}] "
+                "blacklistPatterns={} autoMute={}m muteWebhook={}\n"),
             RC::ensure_str(cfg.server_origin),
             cfg.poll_interval_ms,
             cfg.max_batch,
@@ -239,6 +263,9 @@ namespace PalCrosschat
             RC::ensure_str(cfg.inject_category_name),
             RC::ensure_str(cfg.prefix_na),
             RC::ensure_str(cfg.prefix_eu),
-            RC::ensure_str(cfg.prefix_discord));
+            RC::ensure_str(cfg.prefix_discord),
+            cfg.blocked_words.size(),
+            cfg.auto_mute_minutes,
+            cfg.mute_log_webhook.empty() ? STR("off") : STR("on"));
     }
 }

@@ -3,6 +3,7 @@
 #include "Config.h"
 #include "DbWorker.h"
 #include "Queues.h"
+#include "Webhook.h"
 
 #include <memory>
 
@@ -18,7 +19,7 @@ public:
     PalCrosschatMod() : CppUserModBase()
     {
         ModName = STR("PalCrosschat");
-        ModVersion = STR("1.0.0");
+        ModVersion = STR("1.1.0");
         ModDescription = STR("Relays Palworld chat to a shared MySQL database and injects cross-server messages");
         ModAuthors = STR("ARKADE");
 
@@ -34,9 +35,15 @@ public:
 
         m_outbound = std::make_unique<OutboundQueue>(kQueueMax, "outbound");
         m_inbound = std::make_unique<InboundQueue>(kQueueMax, "inbound");
+        m_webhook = std::make_unique<WebhookWorker>();
         m_db = std::make_unique<DbWorker>(m_config, *m_outbound, *m_inbound);
-        m_capture = std::make_unique<ChatCapture>(m_config, *m_outbound);
+        m_capture = std::make_unique<ChatCapture>(m_config, *m_outbound, m_webhook.get());
         m_inject = std::make_unique<ChatInject>(m_config);
+
+        if (!m_config.mute_log_webhook.empty() && !m_config.blocked_words.empty())
+        {
+            m_webhook->Start();
+        }
 
         m_db->Start();
         Output::send<LogLevel::Normal>(STR("[PalCrosschat] Init complete; waiting for Unreal\n"));
@@ -51,6 +58,10 @@ public:
         if (m_db)
         {
             m_db->Stop();
+        }
+        if (m_webhook)
+        {
+            m_webhook->Stop();
         }
         Output::send<LogLevel::Normal>(STR("[PalCrosschat] Unloaded\n"));
     }
@@ -84,6 +95,7 @@ private:
     Config m_config{};
     std::unique_ptr<OutboundQueue> m_outbound;
     std::unique_ptr<InboundQueue> m_inbound;
+    std::unique_ptr<WebhookWorker> m_webhook;
     std::unique_ptr<DbWorker> m_db;
     std::unique_ptr<ChatCapture> m_capture;
     std::unique_ptr<ChatInject> m_inject;

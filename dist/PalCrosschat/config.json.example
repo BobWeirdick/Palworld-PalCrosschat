@@ -19,5 +19,25 @@
     "PrefixEU": "[EU]",
     "PrefixDiscord": "[Discord]",
     "InjectCategory": "global"
+  },
+  "WordBlacklist": {
+    "BlockedWords": [
+      "(\\b|[^a-zA-Z])[Ff][Uu][Cc][Kk](?:[^a-zA-Z]|\\b)",
+      "(\\b|[^a-zA-Z])[Bb][Ii][Tt][Cc][Hh](?:[^a-zA-Z]|\\b)",
+      "(\\b|[^a-zA-Z])[Cc][Uu][Nn][Tt](?:[^a-zA-Z]|\\b)",
+      "[NnÑñ][EeÉéÈèËëÊê3]+[GgƓɠḠḡǴǵĜĝǦǧĞğĢģǤǥĠġ]+[Rr]",
+      "[NnÑñ][Ii1ÌìÍíÎîÏï]+[GgƓɠḠḡǴǵĜĝǦǧĞğĢģ]+[Rr]",
+      "[CcƇƈĆćĈĉČčÇçĊċȻȼ][OoØø0ÒòÓóÖöÕõÔô]+[CcƇƈĆćĈĉČčÇçĊċȻȼKkƘƙḰḱǨǩĶķ]{2,}",
+      "[Cc][Hh][Ii1ÌìÍíÎîÏï]+[NnÑñ][Kk](?:[^a-zA-Z]|\\b)",
+      "[Pp][OoØø0ÒòÓóÖöÕõÔô]+[Rr][NnÑñ]",
+      "[Cc][OoØø0ÒòÓóÖöÕõÔô]+[Cc][Kk]",
+      "[Rr][EeÉéÈèËëÊê3]+[Tt][AaÂâÅåÀàÁáÃãÄäÆæ@4]+[Rr][Dd]",
+      "[Ff][AaÂâÅåÀàÁáÃãÄäÆæ@4]+[Gg]",
+      "(\\b|[^a-zA-Z])[Ff]+[Uu]+[Cc]+[Kk]+(\\b|[^a-zA-Z])",
+      "(\\b|[^a-zA-Z])[Bb]+[Ii]+[Tt]+[Cc]+[Hh]+(\\b|[^a-zA-Z])",
+      "\\b[rⓡʀ][\\s\\.\\-_]*[a@4αа][\\s\\.\\-_]*[pⓟρ][\\s\\.\\-_]*[e3€е]\\b"
+    ],
+    "AutoMuteMinutes": 5,
+    "MuteLogWebhook": ""
   }
 }
