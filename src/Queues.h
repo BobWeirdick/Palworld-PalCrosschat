@@ -17,6 +17,7 @@ namespace PalCrosschat
     {
         std::string sender_name;
         std::string sender_id;
+        std::string guild_name;
         std::string message;
     };
 
@@ -25,6 +26,7 @@ namespace PalCrosschat
         int64_t id = 0;
         std::string origin;
         std::string sender_name;
+        std::string guild_name;
         std::string message;
     };
 
@@ -32,6 +34,21 @@ namespace PalCrosschat
     {
         std::string webhook_url;
         std::string content;
+    };
+
+    // Discord link: game thread pushes LinkJob; DB thread pushes LinkResult notice.
+    struct LinkJob
+    {
+        std::string connect_code;
+        std::string platform;          // steam / gdk / ps5
+        std::string user_id;           // bare id
+        std::string platform_user_id;  // steam_… / gdk_… / ps5_…
+        std::string player_name;
+    };
+
+    struct LinkResult
+    {
+        std::string notice;
     };
 
     template <typename T>
@@ -99,4 +116,6 @@ namespace PalCrosschat
     using OutboundQueue = BoundedQueue<OutboundMessage>;
     using InboundQueue = BoundedQueue<InboundMessage>;
     using WebhookQueue = BoundedQueue<WebhookJob>;
+    using LinkQueue = BoundedQueue<LinkJob>;
+    using LinkResultQueue = BoundedQueue<LinkResult>;
 }

@@ -4,36 +4,92 @@
 #include "Queues.h"
 
 #include <cstdint>
+#include <deque>
+#include <mutex>
+#include <string>
+
+#include <Unreal/FWeakObjectPtr.hpp>
 
 namespace RC::Unreal
 {
     class UObject;
     class UFunction;
     class UStruct;
-    class FProperty;
+    struct FGuid;
 }
 
 namespace PalCrosschat
 {
+    class WordFilter;
+
     class ChatInject
     {
     public:
-        explicit ChatInject(const Config& config);
+        ChatInject(const Config& config, WordFilter* filter);
+        ~ChatInject() = default;
 
-        // Drain up to MaxBroadcastsPerTick from inbound and broadcast each.
+        // Drain deferred hook work, then up to MaxBroadcastsPerTick from inbound.
         // Call only from on_update (game thread).
         void Drain(InboundQueue& inbound, int max_per_tick);
 
+        // Queue a local Global rebroadcast with this server's ChatFormat prefix.
+        // Safe to call from EnterChat_Receive (no ProcessEvent here).
+        void EnqueueLocalTagged(const std::string& sender_name,
+                                const std::string& guild_name,
+                                const std::string& message,
+                                uint8_t category);
+
+        // Queue red server-notice banner (BroadcastServerNotice). Game-thread flush.
+        void EnqueueServerNotice(const std::string& notice_message);
+
+        // Queue private screen-log on one PlayerController. Stores a weak ref.
+        void EnqueueScreenLog(RC::Unreal::UObject* player_controller, const std::string& message);
+
     private:
-        bool EnsureGameState();
+        enum class DeferredKind : uint8_t
+        {
+            LocalTagged,
+            ServerNotice,
+            ScreenLog,
+        };
+
+        struct DeferredAction
+        {
+            DeferredKind kind = DeferredKind::ServerNotice;
+            std::string sender_name;
+            std::string guild_name;
+            std::string message;
+            uint8_t category = 0;
+            RC::Unreal::FWeakObjectPtr controller{};
+        };
+
+        RC::Unreal::UObject* ResolveGameState();
         bool EnsureBroadcastFunction();
+        bool EnsureServerNoticeFunction();
+        void FlushDeferred(int max_actions);
         bool BroadcastOne(const InboundMessage& msg);
+        bool BroadcastDisplay(const std::string& display_sender,
+                              const std::string& message,
+                              uint8_t category,
+                              const RC::Unreal::FGuid* receiver_only = nullptr);
+        bool BroadcastLocalTagged(const std::string& sender_name,
+                                  const std::string& guild_name,
+                                  const std::string& message,
+                                  uint8_t category);
+        bool ShowServerNotice(const std::string& notice_message);
+        bool SendScreenLog(RC::Unreal::UObject* player_controller, const std::string& message);
 
         std::string PrefixForOrigin(const std::string& origin) const;
+        std::string LocalServerPrefix() const;
 
         const Config& m_config;
-        RC::Unreal::UObject* m_game_state = nullptr;
+        WordFilter* m_filter = nullptr;
+        RC::Unreal::FWeakObjectPtr m_game_state{};
         RC::Unreal::UFunction* m_broadcast_fn = nullptr;
+        RC::Unreal::UFunction* m_server_notice_fn = nullptr;
+
+        std::mutex m_deferred_mutex;
+        std::deque<DeferredAction> m_deferred;
 
         // Reflected offsets inside the ChatMessage struct parameter (relative to struct start).
         bool m_offsets_ready = false;

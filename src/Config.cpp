@@ -153,7 +153,10 @@ namespace PalCrosschat
         const json general = root_json.value("General", json::object());
         const json mysql = root_json.value("MySQL", json::object());
         const json format = root_json.value("Format", json::object());
-        const json blacklist = root_json.value("WordBlacklist", json::object());
+        // Prefer ChatFilter; fall back to legacy WordBlacklist for older configs.
+        const json chat_filter = root_json.contains("ChatFilter")
+                                     ? root_json.value("ChatFilter", json::object())
+                                     : root_json.value("WordBlacklist", json::object());
 
         cfg.server_origin = GetOr<std::string>(general, "ServerOrigin", "");
         cfg.poll_interval_ms = GetOr<int>(general, "PollIntervalMs", cfg.poll_interval_ms);
@@ -173,22 +176,59 @@ namespace PalCrosschat
         cfg.prefix_na = GetOr<std::string>(format, "PrefixNA", cfg.prefix_na);
         cfg.prefix_eu = GetOr<std::string>(format, "PrefixEU", cfg.prefix_eu);
         cfg.prefix_discord = GetOr<std::string>(format, "PrefixDiscord", cfg.prefix_discord);
+        cfg.chat_format = GetOr<std::string>(format, "ChatFormat", cfg.chat_format);
         ApplyInjectCategory(cfg, GetOr<std::string>(format, "InjectCategory", "global"));
+        cfg.show_local_server_tag =
+            GetOr<bool>(format, "ShowLocalServerTag", cfg.show_local_server_tag);
 
-        cfg.auto_mute_minutes = GetOr<int>(blacklist, "AutoMuteMinutes", cfg.auto_mute_minutes);
-        cfg.mute_log_webhook = GetOr<std::string>(blacklist, "MuteLogWebhook", "");
-        if (blacklist.contains("BlockedWords") && blacklist["BlockedWords"].is_array())
+        cfg.mute_log_webhook = GetOr<std::string>(
+            chat_filter,
+            "LogWebhookUrl",
+            GetOr<std::string>(chat_filter, "MuteLogWebhook", ""));
+        cfg.initial_mute_notification = GetOr<std::string>(
+            chat_filter, "InitialMuteNotification", cfg.initial_mute_notification);
+        cfg.active_mute_notification = GetOr<std::string>(
+            chat_filter, "ActiveMuteNotification", cfg.active_mute_notification);
+
+        if (chat_filter.contains("FilteredPatterns") && chat_filter["FilteredPatterns"].is_array())
         {
-            for (const auto& entry : blacklist["BlockedWords"])
+            for (const auto& entry : chat_filter["FilteredPatterns"])
+            {
+                if (!entry.is_object())
+                {
+                    continue;
+                }
+                FilterPatternConfig pattern_cfg;
+                pattern_cfg.pattern = GetOr<std::string>(entry, "Pattern", "");
+                pattern_cfg.mute_minutes = GetOr<int>(entry, "MuteMinutes", 5);
+                pattern_cfg.mute_message = GetOr<std::string>(entry, "MuteMessage", "");
+                if (pattern_cfg.mute_minutes < 0)
+                {
+                    pattern_cfg.mute_minutes = 0;
+                }
+                if (!pattern_cfg.pattern.empty())
+                {
+                    cfg.filter_patterns.push_back(std::move(pattern_cfg));
+                }
+            }
+        }
+        else if (chat_filter.contains("BlockedWords") && chat_filter["BlockedWords"].is_array())
+        {
+            // Legacy WordBlacklist.BlockedWords: string array + shared AutoMuteMinutes.
+            const int legacy_minutes = GetOr<int>(chat_filter, "AutoMuteMinutes", 5);
+            for (const auto& entry : chat_filter["BlockedWords"])
             {
                 if (!entry.is_string())
                 {
                     continue;
                 }
-                std::string pattern = entry.get<std::string>();
-                if (!pattern.empty())
+                FilterPatternConfig pattern_cfg;
+                pattern_cfg.pattern = entry.get<std::string>();
+                pattern_cfg.mute_minutes = legacy_minutes < 0 ? 0 : legacy_minutes;
+                pattern_cfg.mute_message = "blocked word or phrase (chat filter)";
+                if (!pattern_cfg.pattern.empty())
                 {
-                    cfg.blocked_words.push_back(std::move(pattern));
+                    cfg.filter_patterns.push_back(std::move(pattern_cfg));
                 }
             }
         }
@@ -228,11 +268,6 @@ namespace PalCrosschat
         {
             cfg.mysql_port = 3306;
         }
-        if (cfg.auto_mute_minutes < 0)
-        {
-            cfg.auto_mute_minutes = 0;
-        }
-
         cfg.enabled = true;
         return cfg;
     }
@@ -248,8 +283,8 @@ namespace PalCrosschat
 
         RC::Output::send<RC::LogLevel::Normal>(
             STR("[PalCrosschat] Config: origin={} poll={}ms maxBatch={} maxBroadcasts/tick={} verbose={} "
-                "mysql={}:{} user={} db={} backoffMax={}s injectCategory={} prefixes=[{}|{}|{}] "
-                "blacklistPatterns={} autoMute={}m muteWebhook={}\n"),
+                "mysql={}:{} user={} db={} backoffMax={}s injectCategory={} showLocalTag={} "
+                "prefixes=[{}|{}|{}] chatFormat={} chatFilterPatterns={} muteWebhook={}\n"),
             RC::ensure_str(cfg.server_origin),
             cfg.poll_interval_ms,
             cfg.max_batch,
@@ -261,11 +296,12 @@ namespace PalCrosschat
             RC::ensure_str(cfg.mysql_database),
             cfg.reconnect_backoff_max_sec,
             RC::ensure_str(cfg.inject_category_name),
+            cfg.show_local_server_tag ? STR("true") : STR("false"),
             RC::ensure_str(cfg.prefix_na),
             RC::ensure_str(cfg.prefix_eu),
             RC::ensure_str(cfg.prefix_discord),
-            cfg.blocked_words.size(),
-            cfg.auto_mute_minutes,
+            RC::ensure_str(cfg.chat_format),
+            cfg.filter_patterns.size(),
             cfg.mute_log_webhook.empty() ? STR("off") : STR("on"));
     }
 }

@@ -1,6 +1,8 @@
 #include "ChatInject.h"
+#include "ChatFormat.h"
 #include "PalChatApi.h"
 #include "Sanitize.h"
+#include "WordFilter.h"
 
 #include <bit>
 #include <chrono>
@@ -12,12 +14,14 @@
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Helpers/String.hpp>
 #include <Unreal/FString.hpp>
+#include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/NameTypes.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/UnrealCoreStructs.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
+#include <Unreal/Core/Containers/Array.hpp>
 #include <Unreal/FMemory.hpp>
 
 using namespace RC;
@@ -69,10 +73,7 @@ namespace PalCrosschat
             bool m_initialized = false;
         };
 
-        bool ObjectLooksValid(UObject* obj)
-        {
-            return obj != nullptr;
-        }
+        constexpr size_t kMaxDeferredActions = 64;
 
         StringType Utf8ToUe(const std::string& utf8)
         {
@@ -80,7 +81,10 @@ namespace PalCrosschat
         }
     }
 
-    ChatInject::ChatInject(const Config& config) : m_config(config) {}
+    ChatInject::ChatInject(const Config& config, WordFilter* filter)
+        : m_config(config), m_filter(filter)
+    {
+    }
 
     std::string ChatInject::PrefixForOrigin(const std::string& origin) const
     {
@@ -99,27 +103,28 @@ namespace PalCrosschat
         return {};
     }
 
-    bool ChatInject::EnsureGameState()
+    std::string ChatInject::LocalServerPrefix() const
     {
-        if (ObjectLooksValid(m_game_state))
+        return PrefixForOrigin(m_config.server_origin);
+    }
+
+    UObject* ChatInject::ResolveGameState()
+    {
+        // FWeakObjectPtr survives GameState teardown; raw cache + GetFullName() AV'd in UE4SS.
+        if (UObject* cached = m_game_state.Get())
         {
-            // Cheap staleness check: name still contains expected class fragment.
-            try
-            {
-                const auto name = m_game_state->GetFullName();
-                if (name.find(STR("PalGameStateInGame")) != StringType::npos)
-                {
-                    return true;
-                }
-            }
-            catch (...)
-            {
-            }
-            m_game_state = nullptr;
+            return cached;
         }
 
-        m_game_state = UObjectGlobals::FindFirstOf(STR("PalGameStateInGame"));
-        return ObjectLooksValid(m_game_state);
+        m_game_state.Reset();
+        UObject* found = UObjectGlobals::FindFirstOf(STR("PalGameStateInGame"));
+        if (!found)
+        {
+            return nullptr;
+        }
+
+        m_game_state = found;
+        return m_game_state.Get();
     }
 
     bool ChatInject::EnsureBroadcastFunction()
@@ -189,40 +194,21 @@ namespace PalCrosschat
         return true;
     }
 
-    bool ChatInject::BroadcastOne(const InboundMessage& msg)
+    bool ChatInject::BroadcastDisplay(const std::string& display_sender,
+                                      const std::string& message,
+                                      uint8_t category,
+                                      const FGuid* receiver_only)
     {
-        if (!EnsureGameState() || !EnsureBroadcastFunction())
+        UObject* game_state = ResolveGameState();
+        if (!game_state || !EnsureBroadcastFunction())
         {
             return false;
-        }
-
-        std::string clean_message = SanitizeMessage(msg.message);
-        if (clean_message.empty())
-        {
-            return true; // drop silently
-        }
-
-        std::string clean_sender = SanitizeMessage(msg.sender_name, 64);
-        if (clean_sender.empty())
-        {
-            clean_sender = "Unknown";
-        }
-
-        const std::string prefix = PrefixForOrigin(msg.origin);
-        std::string display_sender;
-        if (prefix.empty())
-        {
-            display_sender = clean_sender;
-        }
-        else
-        {
-            display_sender = prefix + " " + clean_sender;
         }
 
         ParamBufferGuard guard(m_broadcast_fn, m_chat_struct, m_chat_param_offset);
         uint8* chat = guard.ChatMessage();
 
-        *std::bit_cast<uint8*>(chat + m_off_category) = m_config.inject_category;
+        *std::bit_cast<uint8*>(chat + m_off_category) = category;
 
         {
             FString* sender_fs = std::bit_cast<FString*>(chat + m_off_sender);
@@ -236,20 +222,300 @@ namespace PalCrosschat
 
         {
             FString* message_fs = std::bit_cast<FString*>(chat + m_off_message);
-            *message_fs = FString(Utf8ToUe(clean_message));
+            *message_fs = FString(Utf8ToUe(message));
         }
 
-        // ReceiverPlayerUIds / MessageArgKeys / MessageArgValues: leave empty (InitializeStruct).
+        if (receiver_only)
+        {
+            auto* receivers = std::bit_cast<TArray<FGuid>*>(chat + m_off_receivers);
+            receivers->Add(*receiver_only);
+        }
+
+        // MessageArgKeys / MessageArgValues: leave empty (InitializeStruct).
         // MessageId: leave NAME_None (zeroed / default).
 
-        m_game_state->ProcessEvent(m_broadcast_fn, guard.Data());
+        // Re-resolve immediately before ProcessEvent in case GC ran while building params.
+        game_state = ResolveGameState();
+        if (!game_state)
+        {
+            return false;
+        }
+        game_state->ProcessEvent(m_broadcast_fn, guard.Data());
         return true;
+    }
+
+    void ChatInject::EnqueueLocalTagged(const std::string& sender_name,
+                                        const std::string& guild_name,
+                                        const std::string& message,
+                                        uint8_t category)
+    {
+        DeferredAction action{};
+        action.kind = DeferredKind::LocalTagged;
+        action.sender_name = sender_name;
+        action.guild_name = guild_name;
+        action.message = message;
+        action.category = category;
+
+        std::lock_guard lock(m_deferred_mutex);
+        if (m_deferred.size() >= kMaxDeferredActions)
+        {
+            m_deferred.pop_front();
+        }
+        m_deferred.push_back(std::move(action));
+    }
+
+    void ChatInject::EnqueueServerNotice(const std::string& notice_message)
+    {
+        DeferredAction action{};
+        action.kind = DeferredKind::ServerNotice;
+        action.message = notice_message;
+
+        std::lock_guard lock(m_deferred_mutex);
+        if (m_deferred.size() >= kMaxDeferredActions)
+        {
+            m_deferred.pop_front();
+        }
+        m_deferred.push_back(std::move(action));
+    }
+
+    void ChatInject::EnqueueScreenLog(UObject* player_controller, const std::string& message)
+    {
+        if (!player_controller)
+        {
+            return;
+        }
+
+        DeferredAction action{};
+        action.kind = DeferredKind::ScreenLog;
+        action.message = message;
+        action.controller = player_controller;
+
+        std::lock_guard lock(m_deferred_mutex);
+        if (m_deferred.size() >= kMaxDeferredActions)
+        {
+            m_deferred.pop_front();
+        }
+        m_deferred.push_back(std::move(action));
+    }
+
+    void ChatInject::FlushDeferred(int max_actions)
+    {
+        for (int i = 0; i < max_actions; ++i)
+        {
+            DeferredAction action;
+            {
+                std::lock_guard lock(m_deferred_mutex);
+                if (m_deferred.empty())
+                {
+                    return;
+                }
+                action = std::move(m_deferred.front());
+                m_deferred.pop_front();
+            }
+
+            switch (action.kind)
+            {
+            case DeferredKind::LocalTagged:
+                BroadcastLocalTagged(
+                    action.sender_name, action.guild_name, action.message, action.category);
+                break;
+            case DeferredKind::ServerNotice:
+                ShowServerNotice(action.message);
+                break;
+            case DeferredKind::ScreenLog:
+                if (UObject* controller = action.controller.Get())
+                {
+                    SendScreenLog(controller, action.message);
+                }
+                break;
+            }
+        }
+    }
+
+    bool ChatInject::BroadcastLocalTagged(const std::string& sender_name,
+                                          const std::string& guild_name,
+                                          const std::string& message,
+                                          uint8_t category)
+    {
+        const std::string prefix = LocalServerPrefix();
+
+        std::string clean_sender = SanitizeMessage(sender_name, 64);
+        if (clean_sender.empty())
+        {
+            clean_sender = "Unknown";
+        }
+
+        std::string clean_message = SanitizeMessage(message);
+        if (clean_message.empty())
+        {
+            return false;
+        }
+
+        const std::string clean_guild = SanitizeMessage(guild_name, 64);
+        auto [display_sender, display_message] = ApplyChatFormat(
+            m_config.chat_format, prefix, clean_guild, clean_sender, clean_message);
+        // Never clear/replace local chat with an empty Message — client drops it.
+        if (display_message.empty())
+        {
+            return false;
+        }
+        return BroadcastDisplay(display_sender, display_message, category);
+    }
+
+    bool ChatInject::EnsureServerNoticeFunction()
+    {
+        if (m_server_notice_fn)
+        {
+            return true;
+        }
+
+        m_server_notice_fn =
+            UObjectGlobals::StaticFindObject<UFunction*>(nullptr, nullptr, SERVER_NOTICE_FUNC_PATH);
+        if (!m_server_notice_fn)
+        {
+            Output::send<LogLevel::Error>(
+                STR("[PalCrosschat] Could not find {}\n"), SERVER_NOTICE_FUNC_PATH);
+            return false;
+        }
+        return true;
+    }
+
+    bool ChatInject::ShowServerNotice(const std::string& notice_message)
+    {
+        std::string clean = SanitizeNotice(notice_message, 512);
+        if (clean.empty())
+        {
+            return false;
+        }
+        UObject* game_state = ResolveGameState();
+        if (!game_state || !EnsureServerNoticeFunction())
+        {
+            return false;
+        }
+
+        const auto size = m_server_notice_fn->GetParmsSize();
+        std::vector<uint8> buf(size > 0 ? size : sizeof(FString), 0);
+
+        if (FProperty* msg_prop =
+                m_server_notice_fn->FindProperty(FName(STR("NoticeMessage"), FNAME_Find)))
+        {
+            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.data()))
+            {
+                *msg = FString(Utf8ToUe(clean));
+            }
+        }
+        else
+        {
+            *std::bit_cast<FString*>(buf.data()) = FString(Utf8ToUe(clean));
+        }
+
+        game_state = ResolveGameState();
+        if (!game_state)
+        {
+            return false;
+        }
+        game_state->ProcessEvent(m_server_notice_fn, buf.data());
+        return true;
+    }
+
+    bool ChatInject::SendScreenLog(UObject* player_controller, const std::string& message)
+    {
+        // Caller must pass a live object (e.g. from FWeakObjectPtr::Get()).
+        if (!player_controller)
+        {
+            return false;
+        }
+
+        std::string clean = SanitizeNotice(message, 512);
+        if (clean.empty())
+        {
+            return false;
+        }
+
+        UFunction* fn = player_controller->GetFunctionByNameInChain(STR("SendScreenLogToClient"));
+        if (!fn)
+        {
+            return false;
+        }
+
+        const auto size = fn->GetParmsSize();
+        std::vector<uint8> buf(size > 0 ? size : 64, 0);
+
+        // Best-effort reflected fill: Message, Color (skip / leave default), Duration, Key.
+        if (FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find)))
+        {
+            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.data()))
+            {
+                *msg = FString(Utf8ToUe(clean));
+            }
+        }
+        if (FProperty* dur_prop = fn->FindProperty(FName(STR("Duration"), FNAME_Find)))
+        {
+            if (float* dur = dur_prop->ContainerPtrToValuePtr<float>(buf.data()))
+            {
+                *dur = 8.0f;
+            }
+        }
+        if (FProperty* key_prop = fn->FindProperty(FName(STR("Key"), FNAME_Find)))
+        {
+            if (FName* key = key_prop->ContainerPtrToValuePtr<FName>(buf.data()))
+            {
+                *key = FName(STR("PalCrosschatMute"), FNAME_Add);
+            }
+        }
+        // Color left default-zero; client still shows the log line.
+
+        player_controller->ProcessEvent(fn, buf.data());
+        return true;
+    }
+
+    bool ChatInject::BroadcastOne(const InboundMessage& msg)
+    {
+        std::string clean_message = SanitizeMessage(msg.message);
+        if (clean_message.empty())
+        {
+            return true; // drop silently
+        }
+
+        // Inbound path never hits EnterChat_Receive — filter cross-server/Discord here too.
+        if (m_filter && m_filter->Active())
+        {
+            if (auto matched = m_filter->FindMatch(clean_message))
+            {
+                Output::send<LogLevel::Warning>(
+                    STR("[PalCrosschat] ChatFilter dropped inbound: origin={} sender={} pattern={} msg={}\n"),
+                    RC::ensure_str(msg.origin),
+                    RC::ensure_str(msg.sender_name),
+                    RC::ensure_str(matched->pattern_source),
+                    RC::ensure_str(clean_message));
+                return true; // consumed; do not requeue
+            }
+        }
+
+        std::string clean_sender = SanitizeMessage(msg.sender_name, 64);
+        if (clean_sender.empty())
+        {
+            clean_sender = "Unknown";
+        }
+
+        const std::string prefix = PrefixForOrigin(msg.origin);
+        const std::string clean_guild = SanitizeMessage(msg.guild_name, 64);
+        auto [display_sender, display_message] = ApplyChatFormat(
+            m_config.chat_format, prefix, clean_guild, clean_sender, clean_message);
+        if (display_message.empty())
+        {
+            display_message = clean_message;
+        }
+        return BroadcastDisplay(display_sender, display_message, m_config.inject_category);
     }
 
     void ChatInject::Drain(InboundQueue& inbound, int max_per_tick)
     {
         try
         {
+            // Finish hook-queued ProcessEvent work before inbound injects.
+            FlushDeferred(max_per_tick > 0 ? max_per_tick : 8);
+
             for (int i = 0; i < max_per_tick; ++i)
             {
                 // THREAD BOUNDARY: inbound queue -> game thread (plain structs only). No MySQL here.

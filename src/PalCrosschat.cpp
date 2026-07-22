@@ -4,6 +4,7 @@
 #include "DbWorker.h"
 #include "Queues.h"
 #include "Webhook.h"
+#include "WordFilter.h"
 
 #include <memory>
 
@@ -19,8 +20,8 @@ public:
     PalCrosschatMod() : CppUserModBase()
     {
         ModName = STR("PalCrosschat");
-        ModVersion = STR("1.1.0");
-        ModDescription = STR("Relays Palworld chat to a shared MySQL database and injects cross-server messages");
+        ModVersion = STR("1.5.0");
+        ModDescription = STR("Relays Palworld chat to MySQL, injects cross-server messages, Discord /setdiscord link");
         ModAuthors = STR("ARKADE");
 
         m_config = LoadConfig();
@@ -35,12 +36,17 @@ public:
 
         m_outbound = std::make_unique<OutboundQueue>(kQueueMax, "outbound");
         m_inbound = std::make_unique<InboundQueue>(kQueueMax, "inbound");
+        m_link_jobs = std::make_unique<LinkQueue>(kQueueMax, "link_jobs");
+        m_link_results = std::make_unique<LinkResultQueue>(kQueueMax, "link_results");
         m_webhook = std::make_unique<WebhookWorker>();
-        m_db = std::make_unique<DbWorker>(m_config, *m_outbound, *m_inbound);
-        m_capture = std::make_unique<ChatCapture>(m_config, *m_outbound, m_webhook.get());
-        m_inject = std::make_unique<ChatInject>(m_config);
+        m_filter = std::make_unique<WordFilter>(m_config);
+        m_db = std::make_unique<DbWorker>(
+            m_config, *m_outbound, *m_inbound, *m_link_jobs, *m_link_results);
+        m_inject = std::make_unique<ChatInject>(m_config, m_filter.get());
+        m_capture = std::make_unique<ChatCapture>(
+            m_config, *m_outbound, *m_link_jobs, m_webhook.get(), m_filter.get(), m_inject.get());
 
-        if (!m_config.mute_log_webhook.empty() && !m_config.blocked_words.empty())
+        if (!m_config.mute_log_webhook.empty() && !m_config.filter_patterns.empty())
         {
             m_webhook->Start();
         }
@@ -74,6 +80,11 @@ public:
         }
 
         m_capture->Register();
+        if (m_config.show_local_server_tag)
+        {
+            Output::send<LogLevel::Normal>(
+                STR("[PalCrosschat] ShowLocalServerTag=true; local Global chat rebroadcast with prefix\n"));
+        }
         Output::send<LogLevel::Normal>(
             STR("[PalCrosschat] Unreal ready; cursor={} connected={}\n"),
             m_db ? m_db->CursorId() : static_cast<int64_t>(-1),
@@ -87,7 +98,19 @@ public:
             return;
         }
 
-        // Game thread only: drain inbound queue and call BroadcastChatMessage.
+        // Game thread only: flush Discord link notices, then chat inject.
+        if (m_link_results)
+        {
+            while (auto result = m_link_results->TryPop())
+            {
+                if (!result->notice.empty())
+                {
+                    m_inject->EnqueueServerNotice(result->notice);
+                }
+            }
+        }
+
+        // Game thread only: flush deferred hook work, then inbound BroadcastChatMessage.
         m_inject->Drain(*m_inbound, m_config.max_broadcasts_per_tick);
     }
 
@@ -95,10 +118,13 @@ private:
     Config m_config{};
     std::unique_ptr<OutboundQueue> m_outbound;
     std::unique_ptr<InboundQueue> m_inbound;
+    std::unique_ptr<LinkQueue> m_link_jobs;
+    std::unique_ptr<LinkResultQueue> m_link_results;
     std::unique_ptr<WebhookWorker> m_webhook;
+    std::unique_ptr<WordFilter> m_filter;
     std::unique_ptr<DbWorker> m_db;
-    std::unique_ptr<ChatCapture> m_capture;
     std::unique_ptr<ChatInject> m_inject;
+    std::unique_ptr<ChatCapture> m_capture;
 };
 
 #define PAL_CROSSCHAT_API __declspec(dllexport)

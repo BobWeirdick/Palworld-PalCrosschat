@@ -91,28 +91,59 @@ cmake --build build --config Game__Shipping__Win64
 | Password | MySQL | | Never logged. |
 | Database | MySQL | (required) | |
 | ReconnectBackoffMaxSec | MySQL | 30 | Cap for exponential reconnect backoff. |
-| PrefixNA | Format | `[NA]` | Prefix for messages originating from pal-na. |
-| PrefixEU | Format | `[EU]` | Prefix for messages originating from pal-eu. |
-| PrefixDiscord | Format | `[Discord]` | Prefix for Discord-origin messages. |
+| PrefixNA | Format | `NA` | Value for `{prefix}` when origin is pal-na. |
+| PrefixEU | Format | `EU` | Value for `{prefix}` when origin is pal-eu. |
+| PrefixDiscord | Format | `Discord` | Value for `{prefix}` when origin is discord. |
+| ChatFormat | Format | `[{prefix}] [{guild}] {player}: {message}` | In-game crosschat line template. Placeholders: `{prefix}`, `{guild}`, `{player}`, `{message}`. Empty guild removes stray `[]`. Split into Sender + Message for Palworld’s `[Sender]:Message` UI (expect a `]` before `:` — same as native `[Name]: text`). |
 | InjectCategory | Format | `global` | `global` (1) or `discord` (4). |
-| BlockedWords | WordBlacklist | `[]` | Regex patterns (ECMAScript). Matching chat is suppressed and not relayed. Invalid patterns are skipped with a warning. |
-| AutoMuteMinutes | WordBlacklist | `5` | After a blacklist hit, block that player's chat for N minutes. `0` = block the matching message only (no timed mute). |
-| MuteLogWebhook | WordBlacklist | `""` | Optional Discord webhook URL for mute/block logs. Empty disables. |
+| ShowLocalServerTag | Format | `false` | When `true`, local Global chat is cleared and rebroadcast using `ChatFormat` (same look as cross-server). |
+| LogWebhookUrl | ChatFilter | `""` | Optional Discord webhook URL for mute/block logs. Empty disables. |
+| InitialMuteNotification | ChatFilter | `You have been muted for {mutetime}!` | Banner title line on first mute. Placeholders: `{mutetime}`, `{mutemessage}`, `{remainingtime}`. |
+| ActiveMuteNotification | ChatFilter | `You are muted! Time remaining: {remainingtime}` | Banner title when a muted player chats again (no MuteMessage). Placeholder: `{remainingtime}`. |
+| FilteredPatterns | ChatFilter | `[]` | Array of `{ Pattern, MuteMinutes, MuteMessage }`. Each `Pattern` is a case-insensitive ECMAScript regex. |
 
 If `config.json` is missing, MySQL fields are empty, or `ServerOrigin` is invalid, the mod logs an error and disables itself. The game server keeps running.
 
-### WordBlacklist
+### ChatFilter
 
-Each `BlockedWords` entry is compiled as an ECMAScript regex and tested with `regex_search` against sanitized chat text. On a hit the message is cleared in the `EnterChat_Receive` pre-hook (so it never broadcasts or relays), the sender is auto-muted for `AutoMuteMinutes` when that value is > 0, and an optional Discord webhook is posted asynchronously. While muted, further chat from that player is dropped silently.
+On a local hit the message is cleared in `EnterChat_Receive` (never broadcasts or relays). The player is muted for that pattern’s `MuteMinutes` (`0` = block only). A red **Notifications from the server** banner is shown via `BroadcastServerNotice`:
+
+- Initial: `{InitialMuteNotification}` plus the pattern’s `MuteMessage` on the next line  
+- Active (chat while muted): `{ActiveMuteNotification}` only (throttled every 15s)
+
+The client hardcodes the header text “Notifications from the server”; only the notice body is controllable. `BroadcastServerNotice` is NetMulticast (all clients can see the banner). A private `SendScreenLogToClient` line is also sent to the muted player.
+
+Legacy `WordBlacklist` / `BlockedWords` configs still load if `ChatFilter` is absent.
+
+Cross-server and Discord messages are filtered again on inject (`BroadcastChatMessage`). Inbound hits are dropped only (no mute of remote senders).
 
 ## Database contract
 
 Tables already exist (do not create them from this mod):
 
-- `crosschat_messages(id, origin, sender_name, sender_id, message, created_at)`
+- `crosschat_messages(id, origin, sender_name, sender_id, guild_name, message, created_at)`
 - `crosschat_cursors(consumer, last_id)`
+- `crosschat_players(DiscordId, Platform, UserId, PlatformUserId, PlayerName, LinkedAt, ConnectCode)` — Discord linking
 
-This mod INSERTs with `origin = ServerOrigin` and SELECTs `WHERE id > ? AND origin != ?`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
+This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ?`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
+
+### Discord `/setdiscord`
+
+When a player types `/setdiscord CODE` in chat:
+
+1. The command is suppressed (not relayed to MySQL chat).
+2. The mod reads `APalPlayerState::AccountName` and normalizes to `steam_…` / `gdk_…` / `ps5_…`.
+3. It looks up `ConnectCode` on `crosschat_players` and completes the link (`Platform`, `UserId`, `PlatformUserId`, `PlayerName`, `LinkedAt`, clears `ConnectCode`).
+4. A server notice reports success or failure.
+
+Codes are created by the CrosschatBot **Link Discord** panel button.
+
+If you already have the tables without `guild_name`, run:
+
+```sql
+ALTER TABLE crosschat_messages
+  ADD COLUMN guild_name VARCHAR(64) NOT NULL DEFAULT '' AFTER sender_id;
+```
 
 If tables are missing, the mod logs: schema not found, run `schema.sql` from the bot project, and keeps retrying on the backoff schedule.
 
@@ -121,8 +152,8 @@ If tables are missing, the mod logs: schema not found, run `schema.sql` from the
 Insert a fake row and expect it in game within about two poll intervals:
 
 ```sql
-INSERT INTO crosschat_messages (origin, sender_name, message)
-VALUES ('discord', 'TestUser', 'hello from the database');
+INSERT INTO crosschat_messages (origin, sender_name, guild_name, message)
+VALUES ('discord', 'TestUser', '', 'hello from the database');
 ```
 
 Type a global chat message in game and confirm a row with `origin = ServerOrigin` appears within about one second under normal load.

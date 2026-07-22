@@ -6,6 +6,13 @@
 
 namespace PalCrosschat
 {
+    struct FilterPatternConfig
+    {
+        std::string pattern;
+        int mute_minutes = 5;
+        std::string mute_message;
+    };
+
     struct Config
     {
         bool enabled = false;
@@ -26,17 +33,24 @@ namespace PalCrosschat
         int reconnect_backoff_max_sec = 30;
 
         // Format
-        std::string prefix_na = "[NA]";
-        std::string prefix_eu = "[EU]";
-        std::string prefix_discord = "[Discord]";
+        // Used inside ChatFormat as {prefix}. Prefer "NA"/"EU"/"Discord" when ChatFormat
+        // already wraps with [{prefix}].
+        std::string prefix_na = "NA";
+        std::string prefix_eu = "EU";
+        std::string prefix_discord = "Discord";
+        // Placeholders: {prefix}, {guild}, {player}, {message}
+        std::string chat_format = "[{prefix}] [{guild}] {player}: {message}";
         // InjectCategory: "global" -> 1, "discord" -> 4
         uint8_t inject_category = 1;
         std::string inject_category_name = "global";
+        // When true, local Global chat is rebroadcast using ChatFormat (same as cross-server).
+        bool show_local_server_tag = false;
 
-        // WordBlacklist — each BlockedWords entry is a regex (ECMAScript).
-        std::vector<std::string> blocked_words;
-        int auto_mute_minutes = 5;
+        // ChatFilter
         std::string mute_log_webhook;
+        std::string initial_mute_notification = "You have been muted for {mutetime}!";
+        std::string active_mute_notification = "You are muted! Time remaining: {remainingtime}";
+        std::vector<FilterPatternConfig> filter_patterns;
     };
 
     // Loads Mods/PalCrosschat/config.json (mod root next to dlls/).

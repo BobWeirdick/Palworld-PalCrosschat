@@ -90,6 +90,9 @@ namespace PalCrosschat
             MYSQL_STMT* StmtCursorGet() const { return m_stmt_cursor_get; }
             MYSQL_STMT* StmtCursorUpsert() const { return m_stmt_cursor_upsert; }
             MYSQL_STMT* StmtMaxId() const { return m_stmt_max_id; }
+            MYSQL_STMT* StmtLinkLookup() const { return m_stmt_link_lookup; }
+            MYSQL_STMT* StmtLinkConflict() const { return m_stmt_link_conflict; }
+            MYSQL_STMT* StmtLinkComplete() const { return m_stmt_link_complete; }
 
             bool PrepareStatements()
             {
@@ -100,19 +103,24 @@ namespace PalCrosschat
                 m_stmt_cursor_get = mysql_stmt_init(m_mysql);
                 m_stmt_cursor_upsert = mysql_stmt_init(m_mysql);
                 m_stmt_max_id = mysql_stmt_init(m_mysql);
+                m_stmt_link_lookup = mysql_stmt_init(m_mysql);
+                m_stmt_link_conflict = mysql_stmt_init(m_mysql);
+                m_stmt_link_complete = mysql_stmt_init(m_mysql);
 
                 if (!m_stmt_insert || !m_stmt_select || !m_stmt_cursor_get || !m_stmt_cursor_upsert ||
-                    !m_stmt_max_id)
+                    !m_stmt_max_id || !m_stmt_link_lookup || !m_stmt_link_conflict ||
+                    !m_stmt_link_complete)
                 {
                     FreeStmts();
                     return false;
                 }
 
                 const char* insert_sql =
-                    "INSERT INTO crosschat_messages (origin, sender_name, sender_id, message) "
-                    "VALUES (?, ?, ?, ?)";
+                    "INSERT INTO crosschat_messages "
+                    "(origin, sender_name, sender_id, guild_name, message) "
+                    "VALUES (?, ?, ?, ?, ?)";
                 const char* select_sql =
-                    "SELECT id, origin, sender_name, message FROM crosschat_messages "
+                    "SELECT id, origin, sender_name, guild_name, message FROM crosschat_messages "
                     "WHERE id > ? AND origin != ? ORDER BY id ASC LIMIT ?";
                 const char* cursor_get_sql =
                     "SELECT last_id FROM crosschat_cursors WHERE consumer = ? LIMIT 1";
@@ -120,12 +128,24 @@ namespace PalCrosschat
                     "INSERT INTO crosschat_cursors (consumer, last_id) VALUES (?, ?) "
                     "ON DUPLICATE KEY UPDATE last_id = VALUES(last_id)";
                 const char* max_id_sql = "SELECT COALESCE(MAX(id), 0) FROM crosschat_messages";
+                const char* link_lookup_sql =
+                    "SELECT DiscordId FROM crosschat_players WHERE ConnectCode = ? LIMIT 1";
+                const char* link_conflict_sql =
+                    "SELECT DiscordId FROM crosschat_players "
+                    "WHERE PlatformUserId = ? AND UserId IS NOT NULL AND UserId != '' LIMIT 1";
+                const char* link_complete_sql =
+                    "UPDATE crosschat_players SET Platform = ?, UserId = ?, PlatformUserId = ?, "
+                    "PlayerName = ?, ConnectCode = NULL, LinkedAt = NOW() "
+                    "WHERE ConnectCode = ?";
 
                 if (mysql_stmt_prepare(m_stmt_insert, insert_sql, static_cast<unsigned long>(std::strlen(insert_sql))) != 0 ||
                     mysql_stmt_prepare(m_stmt_select, select_sql, static_cast<unsigned long>(std::strlen(select_sql))) != 0 ||
                     mysql_stmt_prepare(m_stmt_cursor_get, cursor_get_sql, static_cast<unsigned long>(std::strlen(cursor_get_sql))) != 0 ||
                     mysql_stmt_prepare(m_stmt_cursor_upsert, cursor_upsert_sql, static_cast<unsigned long>(std::strlen(cursor_upsert_sql))) != 0 ||
-                    mysql_stmt_prepare(m_stmt_max_id, max_id_sql, static_cast<unsigned long>(std::strlen(max_id_sql))) != 0)
+                    mysql_stmt_prepare(m_stmt_max_id, max_id_sql, static_cast<unsigned long>(std::strlen(max_id_sql))) != 0 ||
+                    mysql_stmt_prepare(m_stmt_link_lookup, link_lookup_sql, static_cast<unsigned long>(std::strlen(link_lookup_sql))) != 0 ||
+                    mysql_stmt_prepare(m_stmt_link_conflict, link_conflict_sql, static_cast<unsigned long>(std::strlen(link_conflict_sql))) != 0 ||
+                    mysql_stmt_prepare(m_stmt_link_complete, link_complete_sql, static_cast<unsigned long>(std::strlen(link_complete_sql))) != 0)
                 {
                     return false;
                 }
@@ -146,6 +166,9 @@ namespace PalCrosschat
                 free_one(m_stmt_cursor_get);
                 free_one(m_stmt_cursor_upsert);
                 free_one(m_stmt_max_id);
+                free_one(m_stmt_link_lookup);
+                free_one(m_stmt_link_conflict);
+                free_one(m_stmt_link_complete);
             }
 
         private:
@@ -155,6 +178,9 @@ namespace PalCrosschat
             MYSQL_STMT* m_stmt_cursor_get = nullptr;
             MYSQL_STMT* m_stmt_cursor_upsert = nullptr;
             MYSQL_STMT* m_stmt_max_id = nullptr;
+            MYSQL_STMT* m_stmt_link_lookup = nullptr;
+            MYSQL_STMT* m_stmt_link_conflict = nullptr;
+            MYSQL_STMT* m_stmt_link_complete = nullptr;
         };
 
         void BindString(MYSQL_BIND& bind, const std::string& s, unsigned long& length)
@@ -201,8 +227,16 @@ namespace PalCrosschat
         }
     }
 
-    DbWorker::DbWorker(Config config, OutboundQueue& outbound, InboundQueue& inbound)
-        : m_config(std::move(config)), m_outbound(outbound), m_inbound(inbound)
+    DbWorker::DbWorker(Config config,
+                       OutboundQueue& outbound,
+                       InboundQueue& inbound,
+                       LinkQueue& link_jobs,
+                       LinkResultQueue& link_results)
+        : m_config(std::move(config))
+        , m_outbound(outbound)
+        , m_inbound(inbound)
+        , m_link_jobs(link_jobs)
+        , m_link_results(link_results)
     {
     }
 
@@ -420,12 +454,13 @@ namespace PalCrosschat
 
         auto insert_outbound = [&](const OutboundMessage& msg) -> bool {
             MYSQL_STMT* stmt = conn.StmtInsert();
-            MYSQL_BIND binds[4]{};
-            unsigned long lens[4]{};
+            MYSQL_BIND binds[5]{};
+            unsigned long lens[5]{};
             BindString(binds[0], m_config.server_origin, lens[0]);
             BindString(binds[1], msg.sender_name, lens[1]);
             BindString(binds[2], msg.sender_id, lens[2]);
-            BindString(binds[3], msg.message, lens[3]);
+            BindString(binds[3], msg.guild_name, lens[3]);
+            BindString(binds[4], msg.message, lens[4]);
 
             if (mysql_stmt_bind_param(stmt, binds) != 0 || mysql_stmt_execute(stmt) != 0)
             {
@@ -488,11 +523,12 @@ namespace PalCrosschat
             int64_t id = 0;
             char origin_buf[64]{};
             char sender_buf[64]{};
+            char guild_buf[64]{};
             char message_buf[512]{};
-            unsigned long origin_rlen = 0, sender_rlen = 0, message_rlen = 0;
-            bool origin_null = false, sender_null = false, message_null = false;
+            unsigned long origin_rlen = 0, sender_rlen = 0, guild_rlen = 0, message_rlen = 0;
+            bool origin_null = false, sender_null = false, guild_null = false, message_null = false;
 
-            MYSQL_BIND results[4]{};
+            MYSQL_BIND results[5]{};
             BindI64(results[0], id);
 
             std::memset(&results[1], 0, sizeof(MYSQL_BIND));
@@ -511,10 +547,17 @@ namespace PalCrosschat
 
             std::memset(&results[3], 0, sizeof(MYSQL_BIND));
             results[3].buffer_type = MYSQL_TYPE_STRING;
-            results[3].buffer = message_buf;
-            results[3].buffer_length = sizeof(message_buf) - 1;
-            results[3].length = &message_rlen;
-            results[3].is_null = reinterpret_cast<char*>(&message_null);
+            results[3].buffer = guild_buf;
+            results[3].buffer_length = sizeof(guild_buf) - 1;
+            results[3].length = &guild_rlen;
+            results[3].is_null = reinterpret_cast<char*>(&guild_null);
+
+            std::memset(&results[4], 0, sizeof(MYSQL_BIND));
+            results[4].buffer_type = MYSQL_TYPE_STRING;
+            results[4].buffer = message_buf;
+            results[4].buffer_length = sizeof(message_buf) - 1;
+            results[4].length = &message_rlen;
+            results[4].is_null = reinterpret_cast<char*>(&message_null);
 
             if (mysql_stmt_bind_result(stmt, results) != 0)
             {
@@ -549,6 +592,7 @@ namespace PalCrosschat
                 inbound.id = id;
                 inbound.origin.assign(origin_buf, origin_null ? 0 : origin_rlen);
                 inbound.sender_name.assign(sender_buf, sender_null ? 0 : sender_rlen);
+                inbound.guild_name.assign(guild_buf, guild_null ? 0 : guild_rlen);
                 inbound.message.assign(message_buf, message_null ? 0 : message_rlen);
 
                 // THREAD BOUNDARY: DB thread -> inbound queue (plain structs only).
@@ -580,6 +624,126 @@ namespace PalCrosschat
             return true;
         };
 
+        auto process_link_job = [&](const LinkJob& job) {
+            LinkResult result;
+
+            if (job.connect_code.empty() || job.platform_user_id.empty())
+            {
+                result.notice = "Discord link failed: missing account id.";
+                m_link_results.Push(std::move(result));
+                return;
+            }
+
+            // Conflict: this platform account already linked to a Discord user.
+            {
+                MYSQL_STMT* stmt = conn.StmtLinkConflict();
+                MYSQL_BIND pbinds[1]{};
+                unsigned long plen = 0;
+                BindString(pbinds[0], job.platform_user_id, plen);
+                if (mysql_stmt_bind_param(stmt, pbinds) != 0 || mysql_stmt_execute(stmt) != 0)
+                {
+                    result.notice = "Discord link failed: database error.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+                char discord_buf[64]{};
+                unsigned long discord_len = 0;
+                bool discord_null = false;
+                MYSQL_BIND rbinds[1]{};
+                std::memset(&rbinds[0], 0, sizeof(MYSQL_BIND));
+                rbinds[0].buffer_type = MYSQL_TYPE_STRING;
+                rbinds[0].buffer = discord_buf;
+                rbinds[0].buffer_length = sizeof(discord_buf) - 1;
+                rbinds[0].length = &discord_len;
+                rbinds[0].is_null = reinterpret_cast<char*>(&discord_null);
+                if (mysql_stmt_bind_result(stmt, rbinds) == 0 &&
+                    mysql_stmt_store_result(stmt) == 0 &&
+                    mysql_stmt_fetch(stmt) == 0)
+                {
+                    mysql_stmt_free_result(stmt);
+                    result.notice = "This in-game account is already linked to Discord.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+                mysql_stmt_free_result(stmt);
+            }
+
+            // Lookup connect code.
+            {
+                MYSQL_STMT* stmt = conn.StmtLinkLookup();
+                MYSQL_BIND pbinds[1]{};
+                unsigned long plen = 0;
+                BindString(pbinds[0], job.connect_code, plen);
+                if (mysql_stmt_bind_param(stmt, pbinds) != 0 || mysql_stmt_execute(stmt) != 0)
+                {
+                    result.notice = "Discord link failed: database error.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+                char discord_buf[64]{};
+                unsigned long discord_len = 0;
+                bool discord_null = false;
+                MYSQL_BIND rbinds[1]{};
+                std::memset(&rbinds[0], 0, sizeof(MYSQL_BIND));
+                rbinds[0].buffer_type = MYSQL_TYPE_STRING;
+                rbinds[0].buffer = discord_buf;
+                rbinds[0].buffer_length = sizeof(discord_buf) - 1;
+                rbinds[0].length = &discord_len;
+                rbinds[0].is_null = reinterpret_cast<char*>(&discord_null);
+                if (mysql_stmt_bind_result(stmt, rbinds) != 0 || mysql_stmt_store_result(stmt) != 0)
+                {
+                    mysql_stmt_free_result(stmt);
+                    result.notice = "Discord link failed: database error.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+                const int fetch_rc = mysql_stmt_fetch(stmt);
+                mysql_stmt_free_result(stmt);
+                if (fetch_rc == MYSQL_NO_DATA)
+                {
+                    result.notice = "Invalid Discord connect code.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+                if (fetch_rc != 0 && fetch_rc != MYSQL_DATA_TRUNCATED)
+                {
+                    result.notice = "Discord link failed: database error.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+            }
+
+            // Complete link.
+            {
+                MYSQL_STMT* stmt = conn.StmtLinkComplete();
+                MYSQL_BIND pbinds[5]{};
+                unsigned long lens[5]{};
+                BindString(pbinds[0], job.platform, lens[0]);
+                BindString(pbinds[1], job.user_id, lens[1]);
+                BindString(pbinds[2], job.platform_user_id, lens[2]);
+                BindString(pbinds[3], job.player_name, lens[3]);
+                BindString(pbinds[4], job.connect_code, lens[4]);
+                if (mysql_stmt_bind_param(stmt, pbinds) != 0 || mysql_stmt_execute(stmt) != 0)
+                {
+                    result.notice = "Discord link failed: database error.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+                if (mysql_stmt_affected_rows(stmt) == 0)
+                {
+                    result.notice = "Invalid Discord connect code.";
+                    m_link_results.Push(std::move(result));
+                    return;
+                }
+            }
+
+            result.notice = "Discord account linked successfully.";
+            m_link_results.Push(std::move(result));
+            RC::Output::send<RC::LogLevel::Normal>(
+                STR("[PalCrosschat] Discord link completed for {}\n"),
+                RC::ensure_str(job.platform_user_id));
+        };
+
         RC::Output::send<RC::LogLevel::Normal>(STR("[PalCrosschat] DB worker started\n"));
 
         while (!stop.stop_requested())
@@ -606,6 +770,17 @@ namespace PalCrosschat
                     backoff_sec = (std::min)(backoff_sec * 2, backoff_cap);
                     continue;
                 }
+            }
+
+            // Drain Discord link jobs.
+            while (!stop.stop_requested())
+            {
+                auto link = m_link_jobs.TryPop();
+                if (!link)
+                {
+                    break;
+                }
+                process_link_job(*link);
             }
 
             // Drain outbound queue into INSERTs.

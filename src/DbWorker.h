@@ -15,7 +15,11 @@ namespace PalCrosschat
     class DbWorker
     {
     public:
-        DbWorker(Config config, OutboundQueue& outbound, InboundQueue& inbound);
+        DbWorker(Config config,
+                 OutboundQueue& outbound,
+                 InboundQueue& inbound,
+                 LinkQueue& link_jobs,
+                 LinkResultQueue& link_results);
         ~DbWorker();
 
         DbWorker(const DbWorker&) = delete;
@@ -35,6 +39,8 @@ namespace PalCrosschat
         Config m_config;
         OutboundQueue& m_outbound;
         InboundQueue& m_inbound;
+        LinkQueue& m_link_jobs;
+        LinkResultQueue& m_link_results;
 
         std::jthread m_thread;
         std::atomic<bool> m_started{false};

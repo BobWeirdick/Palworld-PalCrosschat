@@ -5,16 +5,24 @@
 #include "Webhook.h"
 #include "WordFilter.h"
 
-#include <memory>
+#include <cstdint>
+#include <string>
 
 #include <Unreal/UFunctionStructs.hpp>
 
 namespace PalCrosschat
 {
+    class ChatInject;
+
     class ChatCapture
     {
     public:
-        ChatCapture(const Config& config, OutboundQueue& outbound, WebhookWorker* webhook);
+        ChatCapture(const Config& config,
+                    OutboundQueue& outbound,
+                    LinkQueue& link_jobs,
+                    WebhookWorker* webhook,
+                    WordFilter* filter,
+                    ChatInject* inject);
 
         // Call from on_unreal_init. Returns true if the pre-hook registered.
         bool Register();
@@ -29,8 +37,10 @@ namespace PalCrosschat
 
         const Config& m_config;
         OutboundQueue& m_outbound;
+        LinkQueue& m_link_jobs;
         WebhookWorker* m_webhook = nullptr;
-        std::unique_ptr<WordFilter> m_filter;
+        WordFilter* m_filter = nullptr;
+        ChatInject* m_inject = nullptr;
         std::pair<int, int> m_hook_ids{-1, -1};
         bool m_registered = false;
     };

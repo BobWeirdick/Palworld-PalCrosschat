@@ -21,6 +21,13 @@ static constexpr auto BROADCAST_FUNC_PATH =
 // NetMulticast Reliable. Calling this on the server's APalGameStateInGame
 // instance replicates the chat message to all connected clients.
 
+static constexpr auto SERVER_NOTICE_FUNC_PATH =
+    STR("/Script/Pal.PalGameStateInGame:BroadcastServerNotice");
+// Signature: void BroadcastServerNotice(const FString& NoticeMessage)
+// NetMulticast Reliable. Shows the red "Notifications from the server" banner.
+// Note: multicast — all connected clients see the notice (Palworld has no
+// per-player overload for this UI).
+
 // FPalChatMessage fields, exact declaration order:
 //   1. EPalChatCategory Category      (uint8 underlying)
 //   2. FString          Sender

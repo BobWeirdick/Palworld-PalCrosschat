@@ -17,6 +17,9 @@ namespace PalCrosschat
     // Returns empty string if the message should be dropped.
     std::string SanitizeMessage(std::string_view input, size_t max_bytes = 512);
 
+    // Like SanitizeMessage but keeps '\\n' (for multi-line server notices).
+    std::string SanitizeNotice(std::string_view input, size_t max_bytes = 512);
+
     // True if message starts with any of the given prefixes (second-layer loop protection).
     bool StartsWithAnyPrefix(std::string_view message, const std::vector<std::string>& prefixes);
 }

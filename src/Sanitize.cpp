@@ -56,6 +56,38 @@ namespace PalCrosschat
         return TruncateUtf8(cleaned, max_bytes);
     }
 
+    std::string SanitizeNotice(std::string_view input, size_t max_bytes)
+    {
+        std::string out;
+        out.reserve(input.size());
+        for (unsigned char c : input)
+        {
+            if (c == '\n' || (c >= 0x20 && c != 0x7F))
+            {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+
+        size_t start = 0;
+        while (start < out.size() &&
+               (out[start] == ' ' || out[start] == '\t' || out[start] == '\r'))
+        {
+            ++start;
+        }
+        size_t end = out.size();
+        while (end > start &&
+               (out[end - 1] == ' ' || out[end - 1] == '\t' || out[end - 1] == '\r'))
+        {
+            --end;
+        }
+        out = out.substr(start, end - start);
+        if (out.empty())
+        {
+            return {};
+        }
+        return TruncateUtf8(out, max_bytes);
+    }
+
     bool StartsWithAnyPrefix(std::string_view message, const std::vector<std::string>& prefixes)
     {
         for (const auto& prefix : prefixes)
