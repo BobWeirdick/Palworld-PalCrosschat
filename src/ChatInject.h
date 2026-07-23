@@ -9,13 +9,13 @@
 #include <string>
 
 #include <Unreal/FWeakObjectPtr.hpp>
+#include <Unreal/UnrealCoreStructs.hpp>
 
 namespace RC::Unreal
 {
     class UObject;
     class UFunction;
     class UStruct;
-    struct FGuid;
 }
 
 namespace PalCrosschat
@@ -45,12 +45,17 @@ namespace PalCrosschat
         // Queue private screen-log on one PlayerController. Stores a weak ref.
         void EnqueueScreenLog(RC::Unreal::UObject* player_controller, const std::string& message);
 
+        // Queue a chat line visible only to one player (ReceiverPlayerUIds). Shows in chat history.
+        void EnqueuePrivateChat(const RC::Unreal::FGuid& receiver_player_uid,
+                                const std::string& message);
+
     private:
         enum class DeferredKind : uint8_t
         {
             LocalTagged,
             ServerNotice,
             ScreenLog,
+            PrivateChat,
         };
 
         struct DeferredAction
@@ -61,6 +66,8 @@ namespace PalCrosschat
             std::string message;
             uint8_t category = 0;
             RC::Unreal::FWeakObjectPtr controller{};
+            RC::Unreal::FGuid receiver_uid{};
+            bool has_receiver = false;
         };
 
         RC::Unreal::UObject* ResolveGameState();

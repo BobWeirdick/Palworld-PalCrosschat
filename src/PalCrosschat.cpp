@@ -20,8 +20,8 @@ public:
     PalCrosschatMod() : CppUserModBase()
     {
         ModName = STR("PalCrosschat");
-        ModVersion = STR("1.5.0");
-        ModDescription = STR("Relays Palworld chat to MySQL, injects cross-server messages, Discord /setdiscord link");
+        ModVersion = STR("1.65");
+        ModDescription = STR("Relays Palworld chat to MySQL, injects cross-server messages, Discord !setdiscord link");
         ModAuthors = STR("ARKADE");
 
         m_config = LoadConfig();
@@ -98,15 +98,18 @@ public:
             return;
         }
 
-        // Game thread only: flush Discord link notices, then chat inject.
-        if (m_link_results)
+        // Game thread only: finish !setdiscord identity resolve (unsafe inside chat hook).
+        if (m_capture)
+        {
+            m_capture->FlushDeferred();
+        }
+
+        // Game thread only: private link feedback (screen log), then chat inject.
+        if (m_link_results && m_capture)
         {
             while (auto result = m_link_results->TryPop())
             {
-                if (!result->notice.empty())
-                {
-                    m_inject->EnqueueServerNotice(result->notice);
-                }
+                m_capture->DeliverLinkResult(*result);
             }
         }
 

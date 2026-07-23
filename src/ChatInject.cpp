@@ -23,6 +23,7 @@
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/Core/Containers/Array.hpp>
 #include <Unreal/FMemory.hpp>
+#include <Unreal/UnrealFlags.hpp>
 
 using namespace RC;
 using namespace RC::Unreal;
@@ -298,6 +299,28 @@ namespace PalCrosschat
         m_deferred.push_back(std::move(action));
     }
 
+    void ChatInject::EnqueuePrivateChat(const FGuid& receiver_player_uid, const std::string& message)
+    {
+        if (receiver_player_uid == FGuid{} || message.empty())
+        {
+            return;
+        }
+
+        DeferredAction action{};
+        action.kind = DeferredKind::PrivateChat;
+        action.message = message;
+        action.receiver_uid = receiver_player_uid;
+        action.has_receiver = true;
+        action.category = CHAT_CATEGORY_GLOBAL;
+
+        std::lock_guard lock(m_deferred_mutex);
+        if (m_deferred.size() >= kMaxDeferredActions)
+        {
+            m_deferred.pop_front();
+        }
+        m_deferred.push_back(std::move(action));
+    }
+
     void ChatInject::FlushDeferred(int max_actions)
     {
         for (int i = 0; i < max_actions; ++i)
@@ -326,6 +349,13 @@ namespace PalCrosschat
                 if (UObject* controller = action.controller.Get())
                 {
                     SendScreenLog(controller, action.message);
+                }
+                break;
+            case DeferredKind::PrivateChat:
+                if (action.has_receiver)
+                {
+                    BroadcastDisplay(
+                        "PalCrosschat", action.message, action.category, &action.receiver_uid);
                 }
                 break;
             }
@@ -396,6 +426,16 @@ namespace PalCrosschat
         const auto size = m_server_notice_fn->GetParmsSize();
         std::vector<uint8> buf(size > 0 ? size : sizeof(FString), 0);
 
+        for (FProperty* prop :
+             TFieldRange<FProperty>(m_server_notice_fn, EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!prop->HasAnyPropertyFlags(CPF_Parm) || prop->HasAnyPropertyFlags(CPF_ReturnParm))
+            {
+                continue;
+            }
+            prop->InitializeValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
+        }
+
         if (FProperty* msg_prop =
                 m_server_notice_fn->FindProperty(FName(STR("NoticeMessage"), FNAME_Find)))
         {
@@ -404,18 +444,23 @@ namespace PalCrosschat
                 *msg = FString(Utf8ToUe(clean));
             }
         }
-        else
-        {
-            *std::bit_cast<FString*>(buf.data()) = FString(Utf8ToUe(clean));
-        }
 
         game_state = ResolveGameState();
-        if (!game_state)
+        if (game_state)
         {
-            return false;
+            game_state->ProcessEvent(m_server_notice_fn, buf.data());
         }
-        game_state->ProcessEvent(m_server_notice_fn, buf.data());
-        return true;
+
+        for (FProperty* prop :
+             TFieldRange<FProperty>(m_server_notice_fn, EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!prop->HasAnyPropertyFlags(CPF_Parm))
+            {
+                continue;
+            }
+            prop->DestroyValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
+        }
+        return game_state != nullptr;
     }
 
     bool ChatInject::SendScreenLog(UObject* player_controller, const std::string& message)
@@ -441,6 +486,15 @@ namespace PalCrosschat
         const auto size = fn->GetParmsSize();
         std::vector<uint8> buf(size > 0 ? size : 64, 0);
 
+        for (FProperty* prop : TFieldRange<FProperty>(fn, EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!prop->HasAnyPropertyFlags(CPF_Parm) || prop->HasAnyPropertyFlags(CPF_ReturnParm))
+            {
+                continue;
+            }
+            prop->InitializeValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
+        }
+
         // Best-effort reflected fill: Message, Color (skip / leave default), Duration, Key.
         if (FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find)))
         {
@@ -460,12 +514,20 @@ namespace PalCrosschat
         {
             if (FName* key = key_prop->ContainerPtrToValuePtr<FName>(buf.data()))
             {
-                *key = FName(STR("PalCrosschatMute"), FNAME_Add);
+                *key = FName(STR("PalCrosschatLink"), FNAME_Add);
             }
         }
-        // Color left default-zero; client still shows the log line.
 
         player_controller->ProcessEvent(fn, buf.data());
+
+        for (FProperty* prop : TFieldRange<FProperty>(fn, EFieldIterationFlags::IncludeDeprecated))
+        {
+            if (!prop->HasAnyPropertyFlags(CPF_Parm))
+            {
+                continue;
+            }
+            prop->DestroyValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
+        }
         return true;
     }
 

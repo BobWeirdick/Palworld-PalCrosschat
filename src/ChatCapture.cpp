@@ -11,9 +11,15 @@
 #include <utility>
 #include <vector>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Helpers/String.hpp>
 #include <Unreal/FString.hpp>
+#include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
@@ -21,6 +27,8 @@
 #include <Unreal/NameTypes.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/UFunctionStructs.hpp>
+#include <Unreal/UnrealFlags.hpp>
+#include <Unreal/FFrame.hpp>
 
 using namespace RC;
 using namespace RC::Unreal;
@@ -56,14 +64,6 @@ namespace PalCrosschat
                           guid.D);
             return std::string(buf);
         }
-
-        // Locals layout for EnterChat_Receive(const FString& Message, uint8 Category).
-        // Prefer property-offset reads when available; this mirror is the fallback.
-        struct EnterChatReceiveParams
-        {
-            FString Message;
-            uint8 Category;
-        };
 
         UObject* GetPlayerState(UObject* controller)
         {
@@ -231,10 +231,147 @@ namespace PalCrosschat
             return {};
         }
 
+        // BP_GetUniqueId / GetUniqueId -> FUniqueNetIdRepl, then PalUtility::GetPlayerUniqueIdToString.
+        // AccountName is often empty on dedicated servers; UniqueNetId is the reliable path.
+        std::string ResolveViaUniqueNetId(UObject* player_state)
+        {
+            if (!player_state)
+            {
+                return {};
+            }
+
+            UFunction* get_uid = player_state->GetFunctionByNameInChain(STR("BP_GetUniqueId"));
+            if (!get_uid)
+            {
+                get_uid = player_state->GetFunctionByNameInChain(STR("GetUniqueId"));
+            }
+            if (!get_uid)
+            {
+                return {};
+            }
+
+            FProperty* uid_ret = get_uid->GetReturnProperty();
+            if (!uid_ret)
+            {
+                return {};
+            }
+
+            const auto uid_parms_size = get_uid->GetParmsSize();
+            std::vector<uint8> uid_buf(uid_parms_size > 0 ? uid_parms_size : uid_ret->GetElementSize(), 0);
+            player_state->ProcessEvent(get_uid, uid_buf.data());
+            void* uid_value = uid_ret->ContainerPtrToValuePtr<void>(uid_buf.data());
+            if (!uid_value)
+            {
+                return {};
+            }
+
+            UObject* util = UObjectGlobals::StaticFindObject<UObject*>(
+                nullptr, nullptr, STR("/Script/Pal.Default__PalUtility"));
+            if (!util)
+            {
+                return {};
+            }
+
+            UFunction* to_str = util->GetFunctionByNameInChain(STR("GetPlayerUniqueIdToString"));
+            if (!to_str)
+            {
+                return {};
+            }
+
+            FProperty* user_id_prop = to_str->FindProperty(FName(STR("UserId"), FNAME_Find));
+            FProperty* str_ret = to_str->GetReturnProperty();
+            if (!user_id_prop || !str_ret)
+            {
+                return {};
+            }
+
+            const auto to_str_size = to_str->GetParmsSize();
+            std::vector<uint8> to_str_buf(to_str_size > 0 ? to_str_size : 64, 0);
+            for (FProperty* prop : TFieldRange<FProperty>(to_str, EFieldIterationFlags::IncludeDeprecated))
+            {
+                if (!prop->HasAnyPropertyFlags(CPF_Parm) || prop->HasAnyPropertyFlags(CPF_ReturnParm))
+                {
+                    continue;
+                }
+                prop->InitializeValue(prop->ContainerPtrToValuePtr<void>(to_str_buf.data()));
+            }
+
+            user_id_prop->CopyCompleteValue(user_id_prop->ContainerPtrToValuePtr<void>(to_str_buf.data()),
+                                            uid_value);
+            util->ProcessEvent(to_str, to_str_buf.data());
+
+            std::string result;
+            if (FString* fs = str_ret->ContainerPtrToValuePtr<FString>(to_str_buf.data()))
+            {
+                result = NormalizePlatformUserId(FStringToUtf8(*fs));
+            }
+
+            for (FProperty* prop : TFieldRange<FProperty>(to_str, EFieldIterationFlags::IncludeDeprecated))
+            {
+                if (!prop->HasAnyPropertyFlags(CPF_Parm))
+                {
+                    continue;
+                }
+                prop->DestroyValue(prop->ContainerPtrToValuePtr<void>(to_str_buf.data()));
+            }
+
+            return result;
+        }
+
+        // SEH-safe trampoline: C++ objects must not live in the __try frame.
+        struct UniqueNetIdSehCtx
+        {
+            UObject* player_state = nullptr;
+            std::string* out = nullptr;
+            void (*fn)(UObject*, std::string*) = nullptr;
+        };
+
+        void UniqueNetIdSehCall(UObject* player_state, std::string* out)
+        {
+            *out = ResolveViaUniqueNetId(player_state);
+        }
+
+        int UniqueNetIdSehInvoke(UniqueNetIdSehCtx* ctx)
+        {
+            __try
+            {
+                ctx->fn(ctx->player_state, ctx->out);
+                return 1;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return 0;
+            }
+        }
+
+        std::string ResolvePlatformUserId(UObject* player_state)
+        {
+            if (std::string account = NormalizePlatformUserId(ReadAccountName(player_state));
+                !account.empty())
+            {
+                return account;
+            }
+
+            // UniqueNetId ProcessEvent has crashed dedicated servers; catch AVs.
+            std::string via_uid;
+            UniqueNetIdSehCtx ctx{};
+            ctx.player_state = player_state;
+            ctx.out = &via_uid;
+            ctx.fn = &UniqueNetIdSehCall;
+            if (!UniqueNetIdSehInvoke(&ctx))
+            {
+                Output::send<LogLevel::Error>(
+                    STR("[PalCrosschat] !setdiscord: UniqueNetId resolve access-violated\n"));
+                via_uid.clear();
+            }
+            return via_uid;
+        }
+
+
         bool TryParseSetDiscord(const std::string& message, std::string& out_code)
         {
-            // /setdiscord CODE  (case-insensitive command)
-            constexpr std::string_view kCmd = "/setdiscord";
+            // !setdiscord CODE  (! avoids PalDefender treating /… as admin commands)
+            constexpr std::string_view kCmd = "!setdiscord";
             if (message.size() < kCmd.size())
             {
                 return false;
@@ -367,62 +504,193 @@ namespace PalCrosschat
             return body;
         }
 
+        // EnterChat_Receive(const FString& Message, ...) — Message is CPF_ReferenceParm.
+        //
+        // Mutation is ONLY safe via OutParms PropAddr. Treating Locals as FString* and
+        // assigning into *slot has crashed this host (PalServer+0x326e72a, RSI=UTF-16 text)
+        // when Locals actually stores a by-value FString (Data misread as pointer).
+        FString* FindMessageViaOutParms(UnrealScriptFunctionCallableContext& context)
+        {
+            for (FOutParmRec* rec = context.TheStack.OutParms(); rec; rec = rec->NextOutParm)
+            {
+                if (!rec->Property || !rec->PropAddr)
+                {
+                    continue;
+                }
+                if (rec->Property->GetFName() == FName(STR("Message"), FNAME_Find))
+                {
+                    return reinterpret_cast<FString*>(rec->PropAddr);
+                }
+            }
+            return nullptr;
+        }
+
+        bool ReadMessageUtf8(UnrealScriptFunctionCallableContext& context, std::string& out_utf8)
+        {
+            if (FString* msg = FindMessageViaOutParms(context))
+            {
+                out_utf8 = FStringToUtf8(*msg);
+                return true;
+            }
+
+            UFunction* fn = context.TheStack.Node();
+            void* locals = context.TheStack.Locals();
+            if (!fn || !locals)
+            {
+                return false;
+            }
+
+            FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find));
+            if (!msg_prop)
+            {
+                return false;
+            }
+
+            // Read-only fallbacks. Do not use these pointers for assignment/destroy.
+            if (msg_prop->HasAnyPropertyFlags(CPF_ReferenceParm | CPF_OutParm))
+            {
+                if (FString** slot = msg_prop->ContainerPtrToValuePtr<FString*>(locals))
+                {
+                    if (FString* pointed = *slot)
+                    {
+                        out_utf8 = FStringToUtf8(*pointed);
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(locals))
+            {
+                out_utf8 = FStringToUtf8(*msg);
+                return true;
+            }
+            return false;
+        }
+
         bool ReadHookParams(UnrealScriptFunctionCallableContext& context,
                             FString& out_message,
                             uint8& out_category)
         {
-            // Prefer reflected property offsets on the executing UFunction.
-            UFunction* fn = context.TheStack.Node();
-            if (fn)
+            out_category = 0;
+            out_message = FString(STR(""));
+
+            std::string utf8;
+            if (ReadMessageUtf8(context, utf8) && !utf8.empty())
             {
-                FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find));
-                FProperty* cat_prop = fn->FindProperty(FName(STR("Category"), FNAME_Find));
-                void* locals = context.TheStack.Locals();
-                if (msg_prop && cat_prop && locals)
-                {
-                    if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(locals))
-                    {
-                        out_message = *msg;
-                    }
-                    if (uint8* cat = cat_prop->ContainerPtrToValuePtr<uint8>(locals))
-                    {
-                        out_category = *cat;
-                    }
-                    return true;
-                }
+                out_message = FString(RC::ensure_str(utf8).c_str());
             }
 
-            auto& params = context.GetParams<EnterChatReceiveParams>();
-            out_message = params.Message;
-            out_category = params.Category;
-            return true;
-        }
-
-        void ClearMessageInLocals(UnrealScriptFunctionCallableContext& context)
-        {
-            // Suppress broadcast by emptying Message before EnterChat_Receive runs.
-            // Use both reflected Locals and GetParams — EnterChat_Receive takes const FString&.
             UFunction* fn = context.TheStack.Node();
             void* locals = context.TheStack.Locals();
             if (fn && locals)
             {
-                if (FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find)))
+                if (FProperty* cat_prop = fn->FindProperty(FName(STR("Category"), FNAME_Find)))
                 {
-                    if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(locals))
+                    if (uint8* cat = cat_prop->ContainerPtrToValuePtr<uint8>(locals))
                     {
-                        *msg = FString(STR(""));
+                        out_category = *cat;
                     }
                 }
             }
+            return true;
+        }
 
-            try
+        // In-place truncation. `*msg = FString("")` frees the game's buffer through the
+        // mod's allocator binding and reallocates — that heap mismatch is what caused the
+        // delayed PalServer+0x326e72a crashes (freed memory reused, UTF-16 text as pointer).
+        // Instead: write L'\0' into the EXISTING buffer and set Num. No alloc, no free,
+        // no pointer writes; the game still owns and destroys its own buffer.
+        bool TruncateMessageInPlace(FString* msg)
+        {
+            if (!msg)
             {
-                auto& params = context.GetParams<EnterChatReceiveParams>();
-                params.Message = FString(STR(""));
+                return false;
             }
-            catch (...)
+
+            struct RawFString
             {
+                TCHAR* data;
+                int32 num;
+                int32 max;
+            };
+            static_assert(sizeof(RawFString) == 16, "FString layout assumption");
+            static_assert(sizeof(FString) == sizeof(RawFString), "FString != {Data,Num,Max}");
+
+            auto* raw = reinterpret_cast<RawFString*>(msg);
+            // Sanity: reject garbage layouts before touching anything.
+            if (raw->num < 0 || raw->max < 0 || raw->num > raw->max || raw->max > 0x100000)
+            {
+                return false;
             }
+            if (!raw->data || raw->max == 0)
+            {
+                // Already empty; nothing allocated to touch.
+                raw->num = 0;
+                return true;
+            }
+
+            raw->data[0] = static_cast<TCHAR>(0);
+            raw->num = 1; // empty string + terminator, buffer untouched
+            return true;
+        }
+
+        bool TryClearMessage(UnrealScriptFunctionCallableContext& context)
+        {
+            if (FString* msg = FindMessageViaOutParms(context))
+            {
+                return TruncateMessageInPlace(msg);
+            }
+
+            // Locals fallback: same FString* we already read the text through.
+            UFunction* fn = context.TheStack.Node();
+            void* locals = context.TheStack.Locals();
+            if (!fn || !locals)
+            {
+                return false;
+            }
+
+            FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find));
+            if (!msg_prop)
+            {
+                return false;
+            }
+
+            if (msg_prop->HasAnyPropertyFlags(CPF_ReferenceParm | CPF_OutParm))
+            {
+                if (FString** slot = msg_prop->ContainerPtrToValuePtr<FString*>(locals))
+                {
+                    if (FString* pointed = *slot)
+                    {
+                        return TruncateMessageInPlace(pointed);
+                    }
+                }
+                return false;
+            }
+
+            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(locals))
+            {
+                return TruncateMessageInPlace(msg);
+            }
+            return false;
+        }
+
+        bool ReadPlayerUIdProperty(UObject* player_state, FGuid& out_guid)
+        {
+            out_guid = FGuid{};
+            if (!player_state)
+            {
+                return false;
+            }
+            if (FProperty* prop = player_state->GetPropertyByNameInChain(STR("PlayerUId")))
+            {
+                if (FGuid* guid = prop->ContainerPtrToValuePtr<FGuid>(player_state))
+                {
+                    out_guid = *guid;
+                    return out_guid != FGuid{};
+                }
+            }
+            return false;
         }
 
         std::string TruncateForLog(std::string_view input, size_t max_chars)
@@ -525,6 +793,149 @@ namespace PalCrosschat
         }
     }
 
+    void ChatCapture::ProcessSetDiscord(UObject* controller, const std::string& connect_code)
+    {
+        if (!controller)
+        {
+            return;
+        }
+
+        // No GetPlayerName / SendScreenLog ProcessEvent here — those have crashed this server.
+        UObject* player_state = GetPlayerState(controller);
+        const std::string raw_account = ReadAccountName(player_state);
+        std::string sender_name = SanitizeMessage(raw_account, 64);
+        if (sender_name.empty())
+        {
+            sender_name = "Unknown";
+        }
+
+        // Prefer property PlayerUId (no ProcessEvent). Cache steam id after first resolve.
+        FGuid player_uid{};
+        const bool have_uid = ReadPlayerUIdProperty(player_state, player_uid);
+        const std::string uid_key = have_uid ? FormatGuid(player_uid) : std::string{};
+
+        std::string platform_user_id;
+        if (!uid_key.empty())
+        {
+            std::lock_guard lock(m_platform_cache_mutex);
+            if (auto it = m_platform_by_player_uid.find(uid_key); it != m_platform_by_player_uid.end())
+            {
+                platform_user_id = it->second;
+            }
+        }
+        if (platform_user_id.empty())
+        {
+            platform_user_id = ResolvePlatformUserId(player_state);
+            if (!platform_user_id.empty() && !uid_key.empty())
+            {
+                std::lock_guard lock(m_platform_cache_mutex);
+                m_platform_by_player_uid[uid_key] = platform_user_id;
+            }
+        }
+
+        std::string platform;
+        std::string user_id;
+        if (platform_user_id.empty() ||
+            !SplitPlatformUserId(platform_user_id, platform, user_id))
+        {
+            Output::send<LogLevel::Warning>(
+                STR("[PalCrosschat] !setdiscord failed: no platform id (AccountName='{}')\n"),
+                RC::ensure_str(raw_account));
+            return;
+        }
+
+        {
+            LinkClient client{};
+            client.controller = controller;
+            client.player_uid = have_uid ? player_uid : FGuid{};
+            std::lock_guard lock(m_link_controllers_mutex);
+            m_link_clients[platform_user_id] = client;
+        }
+
+        LinkJob job;
+        job.connect_code = SanitizeMessage(connect_code, 16);
+        job.platform = platform;
+        job.user_id = user_id;
+        job.platform_user_id = platform_user_id;
+        job.player_name = sender_name;
+        const int32_t code_len = static_cast<int32_t>(job.connect_code.size());
+        m_link_jobs.Push(std::move(job));
+
+        Output::send<LogLevel::Normal>(
+            STR("[PalCrosschat] !setdiscord queued for {} (code len={} uid={})\n"),
+            RC::ensure_str(platform_user_id),
+            code_len,
+            have_uid ? 1 : 0);
+    }
+
+    void ChatCapture::DeliverLinkResult(const LinkResult& result)
+    {
+        if (result.notice.empty())
+        {
+            return;
+        }
+
+        Output::send<LogLevel::Normal>(
+            STR("[PalCrosschat] {}\n"), RC::ensure_str(result.notice));
+
+        // Chat history feedback (private BroadcastChatMessage). Screen log is easy to miss.
+        LinkClient client{};
+        bool have_client = false;
+        if (!result.platform_user_id.empty())
+        {
+            std::lock_guard lock(m_link_controllers_mutex);
+            if (auto it = m_link_clients.find(result.platform_user_id); it != m_link_clients.end())
+            {
+                client = it->second;
+                m_link_clients.erase(it);
+                have_client = true;
+            }
+        }
+
+        if (!m_inject || !have_client)
+        {
+            return;
+        }
+
+        if (client.player_uid != FGuid{})
+        {
+            m_inject->EnqueuePrivateChat(client.player_uid, result.notice);
+        }
+        else if (UObject* controller = client.controller.Get())
+        {
+            Output::send<LogLevel::Warning>(
+                STR("[PalCrosschat] Link feedback: no PlayerUId; falling back to screen log\n"));
+            m_inject->EnqueueScreenLog(controller, result.notice);
+        }
+    }
+
+    void ChatCapture::FlushDeferred()
+    {
+        for (;;)
+        {
+            PendingSetDiscord pending;
+            {
+                std::lock_guard lock(m_pending_mutex);
+                if (m_pending_setdiscord.empty())
+                {
+                    return;
+                }
+                pending = std::move(m_pending_setdiscord.front());
+                m_pending_setdiscord.pop_front();
+            }
+
+            if (UObject* controller = pending.controller.Get())
+            {
+                ProcessSetDiscord(controller, pending.connect_code);
+            }
+            else
+            {
+                Output::send<LogLevel::Warning>(
+                    STR("[PalCrosschat] !setdiscord: player left before link completed\n"));
+            }
+        }
+    }
+
     void ChatCapture::HandleHook(UnrealScriptFunctionCallableContext& context)
     {
         FString message_fs;
@@ -539,6 +950,36 @@ namespace PalCrosschat
         }
 
         UObject* controller = context.Context;
+
+        // Discord link: suppress chat immediately; resolve UniqueNetId on on_update.
+        // Nested ProcessEvent inside EnterChat_Receive crashes the dedicated server.
+        {
+            std::string connect_code;
+            if (TryParseSetDiscord(message, connect_code))
+            {
+                // Suppress via in-place truncation only (no alloc/free — see
+                // TruncateMessageInPlace). FString assignment here corrupted the heap.
+                const bool cleared = TryClearMessage(context);
+                PendingSetDiscord pending{};
+                pending.controller = controller;
+                pending.connect_code = SanitizeMessage(connect_code, 16);
+                const int32_t code_len = static_cast<int32_t>(pending.connect_code.size());
+                {
+                    std::lock_guard lock(m_pending_mutex);
+                    if (m_pending_setdiscord.size() >= 32)
+                    {
+                        m_pending_setdiscord.pop_front();
+                    }
+                    m_pending_setdiscord.push_back(std::move(pending));
+                }
+                Output::send<LogLevel::Normal>(
+                    STR("[PalCrosschat] !setdiscord accepted (cleared={} code len={})\n"),
+                    cleared ? 1 : 0,
+                    code_len);
+                return;
+            }
+        }
+
         UObject* player_state = GetPlayerState(controller);
         std::string sender_name = SanitizeMessage(ReadPlayerName(player_state), 64);
         if (sender_name.empty())
@@ -561,47 +1002,15 @@ namespace PalCrosschat
             m_inject->EnqueueScreenLog(controller, banner);
         };
 
-        // Discord account link: /setdiscord CODE (never relayed to crosschat).
-        {
-            std::string connect_code;
-            if (TryParseSetDiscord(message, connect_code))
-            {
-                ClearMessageInLocals(context);
-
-                const std::string platform_user_id =
-                    NormalizePlatformUserId(ReadAccountName(player_state));
-                std::string platform;
-                std::string user_id;
-                if (platform_user_id.empty() ||
-                    !SplitPlatformUserId(platform_user_id, platform, user_id))
-                {
-                    show_mute_banner("Discord link failed: could not read platform account id.");
-                    return;
-                }
-
-                LinkJob job;
-                job.connect_code = SanitizeMessage(connect_code, 16);
-                job.platform = platform;
-                job.user_id = user_id;
-                job.platform_user_id = platform_user_id;
-                job.player_name = sender_name;
-                m_link_jobs.Push(std::move(job));
-
-                if (m_config.debug_verbose)
-                {
-                    Output::send<LogLevel::Normal>(
-                        STR("[PalCrosschat] Queued /setdiscord for {}\n"),
-                        RC::ensure_str(platform_user_id));
-                }
-                return;
-            }
-        }
-
         if (m_filter && m_filter->Active())
         {
             if (m_filter->IsMuted(mute_key))
             {
-                ClearMessageInLocals(context);
+                if (!TryClearMessage(context) && m_config.debug_verbose)
+                {
+                    Output::send<LogLevel::Warning>(
+                        STR("[PalCrosschat] Mute suppress skipped (no OutParms Message)\n"));
+                }
 
                 // Active mute: ActiveMuteNotification only (no MuteMessage). Throttle 15s.
                 if (m_filter->TryConsumeMuteNotify(mute_key, std::chrono::seconds(15)))
@@ -627,7 +1036,11 @@ namespace PalCrosschat
 
             if (auto matched = m_filter->FindMatch(message))
             {
-                ClearMessageInLocals(context);
+                if (!TryClearMessage(context) && m_config.debug_verbose)
+                {
+                    Output::send<LogLevel::Warning>(
+                        STR("[PalCrosschat] Filter suppress skipped (no OutParms Message)\n"));
+                }
 
                 const int minutes = matched->mute_minutes;
                 const std::string mute_message = matched->mute_message;
@@ -715,7 +1128,11 @@ namespace PalCrosschat
         if (m_config.show_local_server_tag && m_inject)
         {
             m_inject->EnqueueLocalTagged(sender_name, guild_name, message, category);
-            ClearMessageInLocals(context);
+            if (!TryClearMessage(context) && m_config.debug_verbose)
+            {
+                Output::send<LogLevel::Warning>(
+                    STR("[PalCrosschat] Local-tag suppress skipped (no OutParms Message)\n"));
+            }
         }
 
         OutboundMessage outbound;

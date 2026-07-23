@@ -625,12 +625,16 @@ namespace PalCrosschat
         };
 
         auto process_link_job = [&](const LinkJob& job) {
-            LinkResult result;
+            auto push_result = [&](std::string notice) {
+                LinkResult result;
+                result.notice = std::move(notice);
+                result.platform_user_id = job.platform_user_id;
+                m_link_results.Push(std::move(result));
+            };
 
             if (job.connect_code.empty() || job.platform_user_id.empty())
             {
-                result.notice = "Discord link failed: missing account id.";
-                m_link_results.Push(std::move(result));
+                push_result("Discord link failed: missing account id.");
                 return;
             }
 
@@ -642,8 +646,7 @@ namespace PalCrosschat
                 BindString(pbinds[0], job.platform_user_id, plen);
                 if (mysql_stmt_bind_param(stmt, pbinds) != 0 || mysql_stmt_execute(stmt) != 0)
                 {
-                    result.notice = "Discord link failed: database error.";
-                    m_link_results.Push(std::move(result));
+                    push_result("Discord link failed: database error.");
                     return;
                 }
                 char discord_buf[64]{};
@@ -661,8 +664,7 @@ namespace PalCrosschat
                     mysql_stmt_fetch(stmt) == 0)
                 {
                     mysql_stmt_free_result(stmt);
-                    result.notice = "This in-game account is already linked to Discord.";
-                    m_link_results.Push(std::move(result));
+                    push_result("This in-game account is already linked to Discord.");
                     return;
                 }
                 mysql_stmt_free_result(stmt);
@@ -676,8 +678,7 @@ namespace PalCrosschat
                 BindString(pbinds[0], job.connect_code, plen);
                 if (mysql_stmt_bind_param(stmt, pbinds) != 0 || mysql_stmt_execute(stmt) != 0)
                 {
-                    result.notice = "Discord link failed: database error.";
-                    m_link_results.Push(std::move(result));
+                    push_result("Discord link failed: database error.");
                     return;
                 }
                 char discord_buf[64]{};
@@ -693,22 +694,19 @@ namespace PalCrosschat
                 if (mysql_stmt_bind_result(stmt, rbinds) != 0 || mysql_stmt_store_result(stmt) != 0)
                 {
                     mysql_stmt_free_result(stmt);
-                    result.notice = "Discord link failed: database error.";
-                    m_link_results.Push(std::move(result));
+                    push_result("Discord link failed: database error.");
                     return;
                 }
                 const int fetch_rc = mysql_stmt_fetch(stmt);
                 mysql_stmt_free_result(stmt);
                 if (fetch_rc == MYSQL_NO_DATA)
                 {
-                    result.notice = "Invalid Discord connect code.";
-                    m_link_results.Push(std::move(result));
+                    push_result("Invalid Discord connect code.");
                     return;
                 }
                 if (fetch_rc != 0 && fetch_rc != MYSQL_DATA_TRUNCATED)
                 {
-                    result.notice = "Discord link failed: database error.";
-                    m_link_results.Push(std::move(result));
+                    push_result("Discord link failed: database error.");
                     return;
                 }
             }
@@ -725,20 +723,17 @@ namespace PalCrosschat
                 BindString(pbinds[4], job.connect_code, lens[4]);
                 if (mysql_stmt_bind_param(stmt, pbinds) != 0 || mysql_stmt_execute(stmt) != 0)
                 {
-                    result.notice = "Discord link failed: database error.";
-                    m_link_results.Push(std::move(result));
+                    push_result("Discord link failed: database error.");
                     return;
                 }
                 if (mysql_stmt_affected_rows(stmt) == 0)
                 {
-                    result.notice = "Invalid Discord connect code.";
-                    m_link_results.Push(std::move(result));
+                    push_result("Invalid Discord connect code.");
                     return;
                 }
             }
 
-            result.notice = "Discord account linked successfully.";
-            m_link_results.Push(std::move(result));
+            push_result("Discord account linked successfully.");
             RC::Output::send<RC::LogLevel::Normal>(
                 STR("[PalCrosschat] Discord link completed for {}\n"),
                 RC::ensure_str(job.platform_user_id));

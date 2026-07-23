@@ -49,6 +49,7 @@ namespace PalCrosschat
     struct LinkResult
     {
         std::string notice;
+        std::string platform_user_id; // delivers private screen-log to the requester
     };
 
     template <typename T>

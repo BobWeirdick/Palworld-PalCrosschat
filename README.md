@@ -127,14 +127,16 @@ Tables already exist (do not create them from this mod):
 
 This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ?`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
 
-### Discord `/setdiscord`
+### Discord `!setdiscord`
 
-When a player types `/setdiscord CODE` in chat:
+When a player types `!setdiscord CODE` in chat (`!` avoids PalDefender `/` admin handling):
 
-1. The command is suppressed (not relayed to MySQL chat).
-2. The mod reads `APalPlayerState::AccountName` and normalizes to `steam_…` / `gdk_…` / `ps5_…`.
-3. It looks up `ConnectCode` on `crosschat_players` and completes the link (`Platform`, `UserId`, `PlatformUserId`, `PlayerName`, `LinkedAt`, clears `ConnectCode`).
-4. A server notice reports success or failure.
+1. The command is **not relayed to MySQL**. Clearing the in-game chat line is disabled on
+   dedicated servers (mutating `EnterChat_Receive`'s `Message` was crashing); the typed
+   command may still appear locally. Only the private PalCrosschat reply is intentional UI.
+2. The mod resolves the platform user id (`steam_…` / `gdk_…` / `ps5_…`) and caches it.
+3. It looks up `ConnectCode` on `crosschat_players` and completes the link (or reports already linked / invalid code).
+4. A private chat line reports the result to that player only.
 
 Codes are created by the CrosschatBot **Link Discord** panel button.
 
