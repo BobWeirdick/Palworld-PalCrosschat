@@ -45,6 +45,9 @@ namespace PalCrosschat
         std::string inject_category_name = "global";
         // When true, local Global chat is rebroadcast using ChatFormat (same as cross-server).
         bool show_local_server_tag = false;
+        // Stamp injected chat with the real sender's PlayerUId. Console clients mask the
+        // body of chat they cannot attribute ("***"). Set false to restore 1.65 behaviour.
+        bool preserve_sender_uid = true;
 
         // ChatFilter
         std::string mute_log_webhook;

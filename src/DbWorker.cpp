@@ -16,6 +16,12 @@ namespace PalCrosschat
 {
     namespace
     {
+        // ER_NO_SUCH_TABLE = 1146, ER_BAD_FIELD_ERROR = 1054 (schema.sql not upgraded).
+        bool IsSchemaError(unsigned int err)
+        {
+            return err == 1146 || err == 1054;
+        }
+
         class MysqlConnection
         {
         public:
@@ -81,8 +87,7 @@ namespace PalCrosschat
 
             bool IsSchemaMissing() const
             {
-                // ER_NO_SUCH_TABLE = 1146
-                return Errno() == 1146;
+                return IsSchemaError(Errno());
             }
 
             MYSQL_STMT* StmtInsert() const { return m_stmt_insert; }
@@ -117,11 +122,13 @@ namespace PalCrosschat
 
                 const char* insert_sql =
                     "INSERT INTO crosschat_messages "
-                    "(origin, sender_name, sender_id, guild_name, message) "
-                    "VALUES (?, ?, ?, ?, ?)";
+                    "(origin, sender_name, sender_id, guild_name, message, category) "
+                    "VALUES (?, ?, ?, ?, ?, ?)";
+                // category = DB_CATEGORY_GLOBAL: guild/say chat stays on its own server.
                 const char* select_sql =
-                    "SELECT id, origin, sender_name, guild_name, message FROM crosschat_messages "
-                    "WHERE id > ? AND origin != ? ORDER BY id ASC LIMIT ?";
+                    "SELECT id, origin, sender_name, sender_id, guild_name, message "
+                    "FROM crosschat_messages "
+                    "WHERE id > ? AND origin != ? AND category = 0 ORDER BY id ASC LIMIT ?";
                 const char* cursor_get_sql =
                     "SELECT last_id FROM crosschat_cursors WHERE consumer = ? LIMIT 1";
                 const char* cursor_upsert_sql =
@@ -278,8 +285,9 @@ namespace PalCrosschat
 
         auto log_schema_missing = [&]() {
             RC::Output::send<RC::LogLevel::Error>(
-                STR("[PalCrosschat] Schema not found (missing crosschat tables). "
-                    "Run schema.sql from the bot project. Will retry.\n"));
+                STR("[PalCrosschat] Schema out of date (missing crosschat table or column, "
+                    "e.g. crosschat_messages.category). Run schema.sql / the ALTER notes "
+                    "from the bot project. Will retry.\n"));
         };
 
         auto ensure_connected = [&]() -> bool {
@@ -355,7 +363,7 @@ namespace PalCrosschat
 
             if (mysql_stmt_bind_param(stmt, &bind_param) != 0 || mysql_stmt_execute(stmt) != 0)
             {
-                if (conn.IsSchemaMissing() || mysql_stmt_errno(stmt) == 1146)
+                if (conn.IsSchemaMissing() || IsSchemaError(mysql_stmt_errno(stmt)))
                 {
                     log_schema_missing();
                 }
@@ -397,7 +405,7 @@ namespace PalCrosschat
             MYSQL_STMT* max_stmt = conn.StmtMaxId();
             if (mysql_stmt_execute(max_stmt) != 0)
             {
-                if (mysql_stmt_errno(max_stmt) == 1146)
+                if (IsSchemaError(mysql_stmt_errno(max_stmt)))
                 {
                     log_schema_missing();
                 }
@@ -454,17 +462,19 @@ namespace PalCrosschat
 
         auto insert_outbound = [&](const OutboundMessage& msg) -> bool {
             MYSQL_STMT* stmt = conn.StmtInsert();
-            MYSQL_BIND binds[5]{};
-            unsigned long lens[5]{};
+            MYSQL_BIND binds[6]{};
+            unsigned long lens[6]{};
+            int32_t category = static_cast<int32_t>(msg.category);
             BindString(binds[0], m_config.server_origin, lens[0]);
             BindString(binds[1], msg.sender_name, lens[1]);
             BindString(binds[2], msg.sender_id, lens[2]);
             BindString(binds[3], msg.guild_name, lens[3]);
             BindString(binds[4], msg.message, lens[4]);
+            BindI32(binds[5], category);
 
             if (mysql_stmt_bind_param(stmt, binds) != 0 || mysql_stmt_execute(stmt) != 0)
             {
-                if (mysql_stmt_errno(stmt) == 1146)
+                if (IsSchemaError(mysql_stmt_errno(stmt)))
                 {
                     log_schema_missing();
                 }
@@ -486,8 +496,9 @@ namespace PalCrosschat
             if (m_config.debug_verbose)
             {
                 RC::Output::send<RC::LogLevel::Verbose>(
-                    STR("[PalCrosschat] OUT origin={} sender={} msg={}\n"),
+                    STR("[PalCrosschat] OUT origin={} category={} sender={} msg={}\n"),
                     RC::ensure_str(m_config.server_origin),
+                    static_cast<int>(msg.category),
                     RC::ensure_str(msg.sender_name),
                     RC::ensure_str(msg.message));
             }
@@ -507,7 +518,7 @@ namespace PalCrosschat
 
             if (mysql_stmt_bind_param(stmt, params) != 0 || mysql_stmt_execute(stmt) != 0)
             {
-                if (mysql_stmt_errno(stmt) == 1146)
+                if (IsSchemaError(mysql_stmt_errno(stmt)))
                 {
                     log_schema_missing();
                 }
@@ -523,12 +534,15 @@ namespace PalCrosschat
             int64_t id = 0;
             char origin_buf[64]{};
             char sender_buf[64]{};
+            char sender_id_buf[64]{};
             char guild_buf[64]{};
             char message_buf[512]{};
-            unsigned long origin_rlen = 0, sender_rlen = 0, guild_rlen = 0, message_rlen = 0;
-            bool origin_null = false, sender_null = false, guild_null = false, message_null = false;
+            unsigned long origin_rlen = 0, sender_rlen = 0, sender_id_rlen = 0, guild_rlen = 0,
+                          message_rlen = 0;
+            bool origin_null = false, sender_null = false, sender_id_null = false,
+                 guild_null = false, message_null = false;
 
-            MYSQL_BIND results[5]{};
+            MYSQL_BIND results[6]{};
             BindI64(results[0], id);
 
             std::memset(&results[1], 0, sizeof(MYSQL_BIND));
@@ -547,17 +561,24 @@ namespace PalCrosschat
 
             std::memset(&results[3], 0, sizeof(MYSQL_BIND));
             results[3].buffer_type = MYSQL_TYPE_STRING;
-            results[3].buffer = guild_buf;
-            results[3].buffer_length = sizeof(guild_buf) - 1;
-            results[3].length = &guild_rlen;
-            results[3].is_null = reinterpret_cast<char*>(&guild_null);
+            results[3].buffer = sender_id_buf;
+            results[3].buffer_length = sizeof(sender_id_buf) - 1;
+            results[3].length = &sender_id_rlen;
+            results[3].is_null = reinterpret_cast<char*>(&sender_id_null);
 
             std::memset(&results[4], 0, sizeof(MYSQL_BIND));
             results[4].buffer_type = MYSQL_TYPE_STRING;
-            results[4].buffer = message_buf;
-            results[4].buffer_length = sizeof(message_buf) - 1;
-            results[4].length = &message_rlen;
-            results[4].is_null = reinterpret_cast<char*>(&message_null);
+            results[4].buffer = guild_buf;
+            results[4].buffer_length = sizeof(guild_buf) - 1;
+            results[4].length = &guild_rlen;
+            results[4].is_null = reinterpret_cast<char*>(&guild_null);
+
+            std::memset(&results[5], 0, sizeof(MYSQL_BIND));
+            results[5].buffer_type = MYSQL_TYPE_STRING;
+            results[5].buffer = message_buf;
+            results[5].buffer_length = sizeof(message_buf) - 1;
+            results[5].length = &message_rlen;
+            results[5].is_null = reinterpret_cast<char*>(&message_null);
 
             if (mysql_stmt_bind_result(stmt, results) != 0)
             {
@@ -592,6 +613,7 @@ namespace PalCrosschat
                 inbound.id = id;
                 inbound.origin.assign(origin_buf, origin_null ? 0 : origin_rlen);
                 inbound.sender_name.assign(sender_buf, sender_null ? 0 : sender_rlen);
+                inbound.sender_id.assign(sender_id_buf, sender_id_null ? 0 : sender_id_rlen);
                 inbound.guild_name.assign(guild_buf, guild_null ? 0 : guild_rlen);
                 inbound.message.assign(message_buf, message_null ? 0 : message_rlen);
 

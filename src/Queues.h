@@ -19,6 +19,8 @@ namespace PalCrosschat
         std::string sender_id;
         std::string guild_name;
         std::string message;
+        // crosschat_messages.category (0=global, 1=guild, 2=say).
+        uint8_t category = 0;
     };
 
     struct InboundMessage
@@ -26,6 +28,8 @@ namespace PalCrosschat
         int64_t id = 0;
         std::string origin;
         std::string sender_name;
+        // Sender's PlayerUId on the origin server; empty for Discord rows.
+        std::string sender_id;
         std::string guild_name;
         std::string message;
     };

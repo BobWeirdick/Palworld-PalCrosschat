@@ -97,6 +97,7 @@ cmake --build build --config Game__Shipping__Win64
 | ChatFormat | Format | `[{prefix}] [{guild}] {player}: {message}` | In-game crosschat line template. Placeholders: `{prefix}`, `{guild}`, `{player}`, `{message}`. Empty guild removes stray `[]`. Split into Sender + Message for Palworld’s `[Sender]:Message` UI (expect a `]` before `:` — same as native `[Name]: text`). |
 | InjectCategory | Format | `global` | `global` (1) or `discord` (4). |
 | ShowLocalServerTag | Format | `false` | When `true`, local Global chat is cleared and rebroadcast using `ChatFormat` (same look as cross-server). |
+| PreserveSenderUId | Format | `true` | Stamps injected chat with the sender's real `PlayerUId`. Console (Xbox) clients mask the body of chat they cannot attribute to a sender, so with `false` every relayed line shows as `***` for them. |
 | LogWebhookUrl | ChatFilter | `""` | Optional Discord webhook URL for mute/block logs. Empty disables. |
 | InitialMuteNotification | ChatFilter | `You have been muted for {mutetime}!` | Banner title line on first mute. Placeholders: `{mutetime}`, `{mutemessage}`, `{remainingtime}`. |
 | ActiveMuteNotification | ChatFilter | `You are muted! Time remaining: {remainingtime}` | Banner title when a muted player chats again (no MuteMessage). Placeholder: `{remainingtime}`. |
@@ -121,24 +122,44 @@ Cross-server and Discord messages are filtered again on inject (`BroadcastChatMe
 
 Tables already exist (do not create them from this mod):
 
-- `crosschat_messages(id, origin, sender_name, sender_id, guild_name, message, created_at)`
+- `crosschat_messages(id, origin, sender_name, sender_id, guild_name, message, category, created_at)`
 - `crosschat_cursors(consumer, last_id)`
 - `crosschat_players(DiscordId, Platform, UserId, PlatformUserId, PlayerName, LinkedAt, ConnectCode)` — Discord linking
 
-This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ?`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
+This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ? AND category = 0`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
+
+### Chat channel (`category`)
+
+`category` records which in-game channel a line came from: `0` global, `1` guild, `2` say
+(mapped from `EPalChatCategory` so the DB contract survives a game enum renumber). Only
+`category = 0` is forwarded — both by this mod's inbound poll and by CrosschatBot — so guild
+and say chat can never surface on another server or in Discord.
+
+The mod itself still only relays global chat (`RELAYED_CATEGORIES`), so guild/say lines
+normally never reach MySQL at all; the column is the enforcement point for every consumer.
+With `DebugVerbose`, each chat line logs `CHAT pal_cat=… db_cat=… relayed=…`, which is the
+quickest way to confirm what channel the server actually saw for a given message.
 
 ### Discord `!setdiscord`
 
 When a player types `!setdiscord CODE` in chat (`!` avoids PalDefender `/` admin handling):
 
-1. The command is **not relayed to MySQL**. Clearing the in-game chat line is disabled on
-   dedicated servers (mutating `EnterChat_Receive`'s `Message` was crashing); the typed
-   command may still appear locally. Only the private PalCrosschat reply is intentional UI.
+1. The command is **not relayed to MySQL** and the chat line is suppressed by truncating
+   `Message` in place (never by reassigning the `FString` — that mismatched the game's
+   allocator and corrupted the heap). Only the private PalCrosschat reply is visible.
 2. The mod resolves the platform user id (`steam_…` / `gdk_…` / `ps5_…`) and caches it.
 3. It looks up `ConnectCode` on `crosschat_players` and completes the link (or reports already linked / invalid code).
 4. A private chat line reports the result to that player only.
 
 Codes are created by the CrosschatBot **Link Discord** panel button.
+
+Before running 1.66, add the `category` column (the mod's INSERT and poll both use it):
+
+```sql
+ALTER TABLE crosschat_messages
+  ADD COLUMN category TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER message,
+  ADD KEY idx_category_id (category, id);
+```
 
 If you already have the tables without `guild_name`, run:
 
@@ -147,7 +168,7 @@ ALTER TABLE crosschat_messages
   ADD COLUMN guild_name VARCHAR(64) NOT NULL DEFAULT '' AFTER sender_id;
 ```
 
-If tables are missing, the mod logs: schema not found, run `schema.sql` from the bot project, and keeps retrying on the backoff schedule.
+If a table or column is missing, the mod logs that the schema is out of date, tells you to run `schema.sql` from the bot project, and keeps retrying on the backoff schedule.
 
 ## Testing without the bot
 

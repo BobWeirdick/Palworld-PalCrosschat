@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <DynamicOutput/DynamicOutput.hpp>
@@ -33,6 +34,55 @@ namespace PalCrosschat
     namespace
     {
         std::chrono::steady_clock::time_point g_last_inject_exception{};
+
+        // Inverse of ChatCapture's FormatGuid: the 32 hex digits are A, B, C, D in order.
+        bool TryParseGuid(std::string_view text, FGuid& out)
+        {
+            uint32_t words[4]{};
+            int digits = 0;
+            for (const char c : text)
+            {
+                if (c == '-' || c == '{' || c == '}')
+                {
+                    continue;
+                }
+
+                uint32_t value = 0;
+                if (c >= '0' && c <= '9')
+                {
+                    value = static_cast<uint32_t>(c - '0');
+                }
+                else if (c >= 'a' && c <= 'f')
+                {
+                    value = static_cast<uint32_t>(c - 'a' + 10);
+                }
+                else if (c >= 'A' && c <= 'F')
+                {
+                    value = static_cast<uint32_t>(c - 'A' + 10);
+                }
+                else
+                {
+                    return false;
+                }
+
+                if (digits >= 32)
+                {
+                    return false;
+                }
+                words[digits / 8] = (words[digits / 8] << 4) | value;
+                ++digits;
+            }
+
+            if (digits != 32)
+            {
+                return false;
+            }
+            out.A = words[0];
+            out.B = words[1];
+            out.C = words[2];
+            out.D = words[3];
+            return !(out == FGuid{});
+        }
 
         class ParamBufferGuard
         {
@@ -198,7 +248,8 @@ namespace PalCrosschat
     bool ChatInject::BroadcastDisplay(const std::string& display_sender,
                                       const std::string& message,
                                       uint8_t category,
-                                      const FGuid* receiver_only)
+                                      const FGuid* receiver_only,
+                                      const FGuid* sender_player_uid)
     {
         UObject* game_state = ResolveGameState();
         if (!game_state || !EnsureBroadcastFunction())
@@ -217,8 +268,12 @@ namespace PalCrosschat
         }
 
         {
+            // Console (Xbox) clients run received chat through Palworld's word-filter
+            // service and mask the body when the sender cannot be identified, so an
+            // empty SenderPlayerUId shows every injected line as "***".
             FGuid* uid = std::bit_cast<FGuid*>(chat + m_off_sender_uid);
-            *uid = FGuid{};
+            *uid = (sender_player_uid && m_config.preserve_sender_uid) ? *sender_player_uid
+                                                                      : FGuid{};
         }
 
         {
@@ -248,7 +303,8 @@ namespace PalCrosschat
     void ChatInject::EnqueueLocalTagged(const std::string& sender_name,
                                         const std::string& guild_name,
                                         const std::string& message,
-                                        uint8_t category)
+                                        uint8_t category,
+                                        const FGuid& sender_player_uid)
     {
         DeferredAction action{};
         action.kind = DeferredKind::LocalTagged;
@@ -256,6 +312,7 @@ namespace PalCrosschat
         action.guild_name = guild_name;
         action.message = message;
         action.category = category;
+        action.sender_uid = sender_player_uid;
 
         std::lock_guard lock(m_deferred_mutex);
         if (m_deferred.size() >= kMaxDeferredActions)
@@ -339,8 +396,11 @@ namespace PalCrosschat
             switch (action.kind)
             {
             case DeferredKind::LocalTagged:
-                BroadcastLocalTagged(
-                    action.sender_name, action.guild_name, action.message, action.category);
+                BroadcastLocalTagged(action.sender_name,
+                                     action.guild_name,
+                                     action.message,
+                                     action.category,
+                                     action.sender_uid);
                 break;
             case DeferredKind::ServerNotice:
                 ShowServerNotice(action.message);
@@ -365,7 +425,8 @@ namespace PalCrosschat
     bool ChatInject::BroadcastLocalTagged(const std::string& sender_name,
                                           const std::string& guild_name,
                                           const std::string& message,
-                                          uint8_t category)
+                                          uint8_t category,
+                                          const FGuid& sender_player_uid)
     {
         const std::string prefix = LocalServerPrefix();
 
@@ -389,7 +450,12 @@ namespace PalCrosschat
         {
             return false;
         }
-        return BroadcastDisplay(display_sender, display_message, category);
+        const bool have_sender_uid = !(sender_player_uid == FGuid{});
+        return BroadcastDisplay(display_sender,
+                                display_message,
+                                category,
+                                nullptr,
+                                have_sender_uid ? &sender_player_uid : nullptr);
     }
 
     bool ChatInject::EnsureServerNoticeFunction()
@@ -568,7 +634,16 @@ namespace PalCrosschat
         {
             display_message = clean_message;
         }
-        return BroadcastDisplay(display_sender, display_message, m_config.inject_category);
+
+        // Carry the origin server's PlayerUId when we have one (Discord rows have none):
+        // console clients mask chat bodies they cannot attribute to a sender.
+        FGuid sender_uid{};
+        const bool have_sender_uid = TryParseGuid(msg.sender_id, sender_uid);
+        return BroadcastDisplay(display_sender,
+                                display_message,
+                                m_config.inject_category,
+                                nullptr,
+                                have_sender_uid ? &sender_uid : nullptr);
     }
 
     void ChatInject::Drain(InboundQueue& inbound, int max_per_tick)

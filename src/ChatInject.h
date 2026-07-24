@@ -37,7 +37,8 @@ namespace PalCrosschat
         void EnqueueLocalTagged(const std::string& sender_name,
                                 const std::string& guild_name,
                                 const std::string& message,
-                                uint8_t category);
+                                uint8_t category,
+                                const RC::Unreal::FGuid& sender_player_uid);
 
         // Queue red server-notice banner (BroadcastServerNotice). Game-thread flush.
         void EnqueueServerNotice(const std::string& notice_message);
@@ -68,6 +69,7 @@ namespace PalCrosschat
             RC::Unreal::FWeakObjectPtr controller{};
             RC::Unreal::FGuid receiver_uid{};
             bool has_receiver = false;
+            RC::Unreal::FGuid sender_uid{};
         };
 
         RC::Unreal::UObject* ResolveGameState();
@@ -78,11 +80,13 @@ namespace PalCrosschat
         bool BroadcastDisplay(const std::string& display_sender,
                               const std::string& message,
                               uint8_t category,
-                              const RC::Unreal::FGuid* receiver_only = nullptr);
+                              const RC::Unreal::FGuid* receiver_only = nullptr,
+                              const RC::Unreal::FGuid* sender_player_uid = nullptr);
         bool BroadcastLocalTagged(const std::string& sender_name,
                                   const std::string& guild_name,
                                   const std::string& message,
-                                  uint8_t category);
+                                  uint8_t category,
+                                  const RC::Unreal::FGuid& sender_player_uid);
         bool ShowServerNotice(const std::string& notice_message);
         bool SendScreenLog(RC::Unreal::UObject* player_controller, const std::string& message);
 

@@ -40,7 +40,30 @@ static constexpr auto SERVER_NOTICE_FUNC_PATH =
 
 // EPalChatCategory: None=0, Global=1, Guild=2, Say=3, Discord=4
 static constexpr uint8_t CHAT_CATEGORY_GLOBAL  = 1;
+static constexpr uint8_t CHAT_CATEGORY_GUILD   = 2;
+static constexpr uint8_t CHAT_CATEGORY_SAY     = 3;
 static constexpr uint8_t CHAT_CATEGORY_DISCORD = 4;
+
+// crosschat_messages.category values, independent of EPalChatCategory so the DB
+// contract stays stable if the game renumbers its enum.
+static constexpr uint8_t DB_CATEGORY_GLOBAL = 0;
+static constexpr uint8_t DB_CATEGORY_GUILD  = 1;
+static constexpr uint8_t DB_CATEGORY_SAY    = 2;
+
+// Anything unrecognized maps to Say: consumers only forward DB_CATEGORY_GLOBAL,
+// so an unexpected category is dropped rather than leaked into Discord.
+inline uint8_t ToDbChatCategory(uint8_t pal_category)
+{
+    switch (pal_category)
+    {
+    case CHAT_CATEGORY_GLOBAL:
+        return DB_CATEGORY_GLOBAL;
+    case CHAT_CATEGORY_GUILD:
+        return DB_CATEGORY_GUILD;
+    default:
+        return DB_CATEGORY_SAY;
+    }
+}
 
 // Categories this mod relays from local players into the shared DB.
 // Easy to extend if Say/Guild should ever be included.

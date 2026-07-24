@@ -180,6 +180,8 @@ namespace PalCrosschat
         ApplyInjectCategory(cfg, GetOr<std::string>(format, "InjectCategory", "global"));
         cfg.show_local_server_tag =
             GetOr<bool>(format, "ShowLocalServerTag", cfg.show_local_server_tag);
+        cfg.preserve_sender_uid =
+            GetOr<bool>(format, "PreserveSenderUId", cfg.preserve_sender_uid);
 
         cfg.mute_log_webhook = GetOr<std::string>(
             chat_filter,

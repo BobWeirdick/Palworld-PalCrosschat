@@ -1096,6 +1096,20 @@ namespace PalCrosschat
             }
         }
 
+        // Chat channel trace: confirms which EPalChatCategory the server actually sees
+        // per line, so a "guild chat reached Discord" report can be traced to either a
+        // misread category byte or a different mod's relay.
+        if (m_config.debug_verbose)
+        {
+            Output::send<LogLevel::Normal>(
+                STR("[PalCrosschat] CHAT pal_cat={} db_cat={} relayed={} sender={} msg={}\n"),
+                static_cast<int>(category),
+                static_cast<int>(ToDbChatCategory(category)),
+                IsRelayedCategory(category) ? 1 : 0,
+                RC::ensure_str(sender_name),
+                RC::ensure_str(TruncateForLog(message, 80)));
+        }
+
         if (!IsRelayedCategory(category))
         {
             return;
@@ -1127,7 +1141,9 @@ namespace PalCrosschat
         // mutating Locals there crashes the dedicated server.
         if (m_config.show_local_server_tag && m_inject)
         {
-            m_inject->EnqueueLocalTagged(sender_name, guild_name, message, category);
+            // sender_uid keeps the rebroadcast attributable to the real player; console
+            // clients mask the body of chat whose SenderPlayerUId is empty.
+            m_inject->EnqueueLocalTagged(sender_name, guild_name, message, category, sender_uid);
             if (!TryClearMessage(context) && m_config.debug_verbose)
             {
                 Output::send<LogLevel::Warning>(
@@ -1140,6 +1156,7 @@ namespace PalCrosschat
         outbound.sender_id = std::move(sender_id);
         outbound.guild_name = guild_name;
         outbound.message = std::move(message);
+        outbound.category = ToDbChatCategory(category);
 
         // THREAD BOUNDARY: game thread -> outbound queue (plain structs only). No MySQL here.
         m_outbound.Push(std::move(outbound));

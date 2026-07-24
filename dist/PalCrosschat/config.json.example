@@ -20,7 +20,8 @@
     "PrefixDiscord": "Discord",
     "ChatFormat": "[{prefix}] [{guild}] {player}: {message}",
     "InjectCategory": "global",
-    "ShowLocalServerTag": false
+    "ShowLocalServerTag": false,
+    "PreserveSenderUId": true
   },
   "ChatFilter": {
     "LogWebhookUrl": "",
