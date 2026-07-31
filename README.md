@@ -144,20 +144,23 @@ servers and Discord, so global is the only channel ever written there.
 With `DebugVerbose`, each chat line logs `CHAT pal_cat=… relayed=…`, which is the
 quickest way to confirm what channel the server actually saw for a given message.
 
-### Xbox / console dual broadcast (v1.79+, fixed v1.82)
+### Xbox / console dual broadcast (v1.79+, fixed v1.83)
 
 Custom `ChatFormat` Sender tags require a nil `SenderPlayerUId`; Xbox clients mask
 chat bodies they cannot attribute. Injected/rebroadcast lines split via
 `ReceiverPlayerUIds`:
 
 - **steam_ / ps5_** — formatted Sender tags (`[EU][WOWZERS][Name]: hello`, nil uid).
-- **gdk_ or unknown platform** — attributed layout (tags in Message, real
-  `SenderPlayerUId`) so Xbox can show the body. Unknown defaults here because
-  dedicated often leaves Xbox `AccountName` empty (v1.82).
+- **gdk_ or unknown platform** — plain body (`[Name]:hello`, real `SenderPlayerUId`)
+  so Xbox can show the text. Unknown defaults here because dedicated often leaves
+  Xbox `AccountName` empty (v1.82).
 
 With only known Steam/PS5 online, only the formatted broadcast runs. Platform is
 cached from `AccountName` on chat / `!setdiscord`. Discord → game rows have no
 Palworld `PlayerUId`, so Xbox may still mask those lines.
+
+`ChatFormat` is split on the `{message}` placeholder before substitution (v1.83), so
+trailing template junk cannot leave the chat text in the Sender field and double it.
 
 ### Command handling
 

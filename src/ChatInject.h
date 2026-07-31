@@ -90,7 +90,7 @@ namespace PalCrosschat
                                   const std::string& message,
                                   uint8_t category,
                                   const RC::Unreal::FGuid& sender_player_uid);
-        // Formatted+nil uid to steam_/ps5_; attributed+real uid to Xbox/unknown when present.
+        // Formatted+nil uid to steam_/ps5_; plain body+real uid to Xbox/unknown when present.
         bool BroadcastDual(const std::string& xbox_sender,
                            const std::string& xbox_message,
                            const std::string& formatted_sender,

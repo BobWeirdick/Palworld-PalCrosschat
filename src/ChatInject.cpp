@@ -269,10 +269,9 @@ namespace PalCrosschat
 
         {
             // Non-nil SenderPlayerUId: console (Xbox) clients can attribute the line
-            // (nil uid → body masked as ***). The game then ignores our Sender string
-            // and shows the resolved player name. Dual-broadcast callers pass a uid only
-            // on the Xbox plain path; formatted PC path passes nullptr. Unresolvable
-            // non-nil uids render as "------" (v1.68); only pass real PlayerUIds.
+            // (nil uid → body masked as ***). Dual-broadcast callers pass a uid only on
+            // the Xbox plain path (unformatted body); formatted PC path passes nullptr.
+            // Unresolvable non-nil uids render as "------" (v1.68); only pass real PlayerUIds.
             FGuid* uid = std::bit_cast<FGuid*>(chat + m_off_sender_uid);
             *uid = sender_player_uid ? *sender_player_uid : FGuid{};
         }
@@ -498,7 +497,7 @@ namespace PalCrosschat
                 formatted_sender, formatted_message, category, nullptr, nullptr);
         }
 
-        // Xbox/unknown present: formatted+nil to steam_/ps5_; attributed+real uid to rest.
+        // Xbox/unknown present: formatted+nil to steam_/ps5_; plain+real uid to rest.
         bool ok = true;
         if (!others.empty())
         {
@@ -699,7 +698,7 @@ namespace PalCrosschat
         }
 
         // Origin server's PlayerUId when present (Discord rows have none): Xbox
-        // attributed path needs it; formatted PC path uses nil uid.
+        // plain path needs it; formatted PC path uses nil uid.
         FGuid sender_uid{};
         const bool have_sender_uid = TryParseGuid(msg.sender_id, sender_uid);
         return BroadcastDual(xbox_sender,

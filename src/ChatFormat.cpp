@@ -60,12 +60,6 @@ namespace PalCrosschat
             ReplaceAll(text, "[ ]", "");
             CollapseSpaces(text);
         }
-
-        bool EndsWith(std::string_view text, std::string_view suffix)
-        {
-            return text.size() >= suffix.size() &&
-                   text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
-        }
     }
 
     std::pair<std::string, std::string> ApplyChatFormat(std::string_view format,
@@ -74,8 +68,9 @@ namespace PalCrosschat
                                                         std::string_view player,
                                                         std::string_view message)
     {
-        std::string fmt(format);
-        if (fmt.empty())
+        std::string msg_part(message);
+
+        if (format.empty())
         {
             std::string sender;
             if (!prefix.empty())
@@ -91,53 +86,47 @@ namespace PalCrosschat
             {
                 sender = "Unknown";
             }
-            return {std::move(sender), std::string(message)};
+            return {std::move(sender), std::move(msg_part)};
         }
 
-        const bool includes_message = fmt.find("{message}") != std::string::npos;
-        const bool spaced_colon = fmt.find(": {message}") != std::string::npos;
+        // Split on the {message} placeholder BEFORE substitution. Peeling the filled
+        // message text with EndsWith was brittle: trailing junk after {message} (e.g. ']'),
+        // or CleanupEmptyGuildBrackets mutating the body, left the full line in Sender and
+        // doubled the chat under Palworld's native [Sender]:Message wrap.
+        constexpr std::string_view kMessagePh = "{message}";
+        const size_t msg_ph = format.find(kMessagePh);
 
-        ReplaceAll(fmt, "{prefix}", prefix);
-        ReplaceAll(fmt, "{guild}", guild);
-        ReplaceAll(fmt, "{player}", player);
-        ReplaceAll(fmt, "{message}", message);
-        CleanupEmptyGuildBrackets(fmt);
-
-        if (fmt.empty())
+        std::string sender_part;
+        if (msg_ph != std::string::npos)
         {
-            fmt = player.empty() ? "Unknown" : std::string(player);
-        }
+            sender_part.assign(format.substr(0, msg_ph));
+            // Anything after {message} is ignored for both fields (misplaced ']').
 
-        // Palworld always renders: [Sender]:Message
-        // Message MUST be non-empty or the line is dropped / invisible (and ShowLocalServerTag
-        // clears the original chat first — which made typing appear to do nothing).
-        //
-        // Split ChatFormat into Sender + Message. The UI's closing ']' before ':' is native
-        // (same as "[BOB]: hi"). Leading space on Message preserves ": hi" spacing as "]: hi".
-        std::string sender_part = fmt;
-        std::string msg_part(message);
-
-        if (includes_message && !message.empty())
-        {
-            const std::string suffix_spaced = std::string(": ") + std::string(message);
-            const std::string suffix_tight = std::string(":") + std::string(message);
-            if (EndsWith(sender_part, suffix_spaced))
+            // Move ": " / ":" into Message spacing so the UI still shows "]: hi".
+            if (sender_part.size() >= 2 &&
+                sender_part.compare(sender_part.size() - 2, 2, ": ") == 0)
             {
-                sender_part.resize(sender_part.size() - suffix_spaced.size());
-                msg_part = std::string(" ") + std::string(message);
+                sender_part.resize(sender_part.size() - 2);
+                if (!msg_part.empty() && msg_part.front() != ' ')
+                {
+                    msg_part.insert(msg_part.begin(), ' ');
+                }
             }
-            else if (EndsWith(sender_part, suffix_tight))
+            else if (!sender_part.empty() && sender_part.back() == ':')
             {
-                sender_part.resize(sender_part.size() - suffix_tight.size());
-                msg_part = std::string(message);
+                sender_part.pop_back();
             }
         }
-        else if (spaced_colon && !msg_part.empty() && msg_part.front() != ' ')
+        else
         {
-            msg_part.insert(msg_part.begin(), ' ');
+            sender_part.assign(format);
         }
 
-        CollapseSpaces(sender_part);
+        ReplaceAll(sender_part, "{prefix}", prefix);
+        ReplaceAll(sender_part, "{guild}", guild);
+        ReplaceAll(sender_part, "{player}", player);
+        CleanupEmptyGuildBrackets(sender_part);
+
         // Game prepends '['; drop one leading '[' from templates like "[{prefix}] ...".
         if (!sender_part.empty() && sender_part.front() == '[')
         {
@@ -147,6 +136,8 @@ namespace PalCrosschat
         {
             sender_part = player.empty() ? "Unknown" : std::string(player);
         }
+        // Message MUST be non-empty or the line is dropped / invisible (ShowLocalServerTag
+        // clears the original first — empty Message made typing appear to do nothing).
         if (msg_part.empty())
         {
             msg_part = std::string(message);
@@ -156,44 +147,16 @@ namespace PalCrosschat
     }
 
     std::pair<std::string, std::string> ApplyChatFormatAttributed(
-        std::string_view format,
-        std::string_view prefix,
-        std::string_view guild,
+        std::string_view /*format*/,
+        std::string_view /*prefix*/,
+        std::string_view /*guild*/,
         std::string_view player,
         std::string_view message)
     {
-        const std::string fallback_player = player.empty() ? "Unknown" : std::string(player);
-
-        // Build the tag portion with an empty player so ChatFormat's {player} slot
-        // collapses out; then put those tags in front of the real message body.
-        auto [tag_part, msg_part] = ApplyChatFormat(format, prefix, guild, "", message);
-        if (tag_part.empty() || tag_part == "Unknown")
-        {
-            // No prefix/guild left — just the plain message under the real name.
-            return {fallback_player, std::string(message)};
-        }
-
-        std::string tagged = "[";
-        tagged += tag_part;
-        if (!msg_part.empty() && msg_part.front() == ' ')
-        {
-            tagged += msg_part;
-        }
-        else if (!msg_part.empty())
-        {
-            tagged += " ";
-            tagged += msg_part;
-        }
-        else
-        {
-            tagged += " ";
-            tagged += message;
-        }
-        CollapseSpaces(tagged);
-        if (tagged.empty())
-        {
-            tagged = std::string(message);
-        }
-        return {fallback_player, std::move(tagged)};
+        // Xbox / unknown-platform path: plain body + real SenderPlayerUId so the client
+        // can attribute the line. Do not inject ChatFormat tags (those need nil uid and
+        // get masked on Xbox). Renders as [PlayerName]:message.
+        const std::string sender = player.empty() ? "Unknown" : std::string(player);
+        return {sender, std::string(message)};
     }
 }
