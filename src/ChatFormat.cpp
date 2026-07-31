@@ -154,4 +154,46 @@ namespace PalCrosschat
 
         return {std::move(sender_part), std::move(msg_part)};
     }
+
+    std::pair<std::string, std::string> ApplyChatFormatAttributed(
+        std::string_view format,
+        std::string_view prefix,
+        std::string_view guild,
+        std::string_view player,
+        std::string_view message)
+    {
+        const std::string fallback_player = player.empty() ? "Unknown" : std::string(player);
+
+        // Build the tag portion with an empty player so ChatFormat's {player} slot
+        // collapses out; then put those tags in front of the real message body.
+        auto [tag_part, msg_part] = ApplyChatFormat(format, prefix, guild, "", message);
+        if (tag_part.empty() || tag_part == "Unknown")
+        {
+            // No prefix/guild left — just the plain message under the real name.
+            return {fallback_player, std::string(message)};
+        }
+
+        std::string tagged = "[";
+        tagged += tag_part;
+        if (!msg_part.empty() && msg_part.front() == ' ')
+        {
+            tagged += msg_part;
+        }
+        else if (!msg_part.empty())
+        {
+            tagged += " ";
+            tagged += msg_part;
+        }
+        else
+        {
+            tagged += " ";
+            tagged += message;
+        }
+        CollapseSpaces(tagged);
+        if (tagged.empty())
+        {
+            tagged = std::string(message);
+        }
+        return {fallback_player, std::move(tagged)};
+    }
 }

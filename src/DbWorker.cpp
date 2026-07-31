@@ -122,13 +122,12 @@ namespace PalCrosschat
 
                 const char* insert_sql =
                     "INSERT INTO crosschat_messages "
-                    "(origin, sender_name, sender_id, guild_name, message, category) "
-                    "VALUES (?, ?, ?, ?, ?, ?)";
-                // category = DB_CATEGORY_GLOBAL: guild/say chat stays on its own server.
+                    "(origin, sender_name, sender_id, guild_name, message) "
+                    "VALUES (?, ?, ?, ?, ?)";
                 const char* select_sql =
                     "SELECT id, origin, sender_name, sender_id, guild_name, message "
                     "FROM crosschat_messages "
-                    "WHERE id > ? AND origin != ? AND category = 0 ORDER BY id ASC LIMIT ?";
+                    "WHERE id > ? AND origin != ? ORDER BY id ASC LIMIT ?";
                 const char* cursor_get_sql =
                     "SELECT last_id FROM crosschat_cursors WHERE consumer = ? LIMIT 1";
                 const char* cursor_upsert_sql =
@@ -285,9 +284,8 @@ namespace PalCrosschat
 
         auto log_schema_missing = [&]() {
             RC::Output::send<RC::LogLevel::Error>(
-                STR("[PalCrosschat] Schema out of date (missing crosschat table or column, "
-                    "e.g. crosschat_messages.category). Run schema.sql / the ALTER notes "
-                    "from the bot project. Will retry.\n"));
+                STR("[PalCrosschat] Schema out of date (missing crosschat table or column). "
+                    "Run schema.sql / the ALTER notes from the bot project. Will retry.\n"));
         };
 
         auto ensure_connected = [&]() -> bool {
@@ -462,15 +460,13 @@ namespace PalCrosschat
 
         auto insert_outbound = [&](const OutboundMessage& msg) -> bool {
             MYSQL_STMT* stmt = conn.StmtInsert();
-            MYSQL_BIND binds[6]{};
-            unsigned long lens[6]{};
-            int32_t category = static_cast<int32_t>(msg.category);
+            MYSQL_BIND binds[5]{};
+            unsigned long lens[5]{};
             BindString(binds[0], m_config.server_origin, lens[0]);
             BindString(binds[1], msg.sender_name, lens[1]);
             BindString(binds[2], msg.sender_id, lens[2]);
             BindString(binds[3], msg.guild_name, lens[3]);
             BindString(binds[4], msg.message, lens[4]);
-            BindI32(binds[5], category);
 
             if (mysql_stmt_bind_param(stmt, binds) != 0 || mysql_stmt_execute(stmt) != 0)
             {
@@ -496,9 +492,8 @@ namespace PalCrosschat
             if (m_config.debug_verbose)
             {
                 RC::Output::send<RC::LogLevel::Verbose>(
-                    STR("[PalCrosschat] OUT origin={} category={} sender={} msg={}\n"),
+                    STR("[PalCrosschat] OUT origin={} sender={} msg={}\n"),
                     RC::ensure_str(m_config.server_origin),
-                    static_cast<int>(msg.category),
                     RC::ensure_str(msg.sender_name),
                     RC::ensure_str(msg.message));
             }

@@ -82,11 +82,33 @@ namespace PalCrosschat
             return nullptr;
         }
 
-        std::string ReadPlayerName(UObject* player_state)
+        // Property-only — safe inside EnterChat_Receive. Dedicated servers usually leave
+        // PlayerName empty; real names come from GetPlayerName (see ResolvePlayerNameViaPE).
+        std::string ReadPlayerNameProperty(UObject* player_state)
         {
             if (!player_state)
             {
-                return "Unknown";
+                return {};
+            }
+
+            if (FProperty* prop = player_state->GetPropertyByNameInChain(STR("PlayerName")))
+            {
+                if (FString* name = prop->ContainerPtrToValuePtr<FString>(player_state))
+                {
+                    return FStringToUtf8(*name);
+                }
+            }
+
+            return {};
+        }
+
+        // GetPlayerName ProcessEvent — call only outside EnterChat_Receive (on_update /
+        // FlushDeferred). Nested PE in that hook AVs UE4SS on dedicated servers.
+        std::string ResolvePlayerNameViaPE(UObject* player_state)
+        {
+            if (!player_state)
+            {
+                return {};
             }
 
             if (UFunction* fn = player_state->GetFunctionByNameInChain(STR("GetPlayerName")))
@@ -98,31 +120,15 @@ namespace PalCrosschat
                 {
                     if (FString* name = ret->ContainerPtrToValuePtr<FString>(buf.data()))
                     {
-                        std::string utf8 = FStringToUtf8(*name);
-                        if (!utf8.empty())
-                        {
-                            return utf8;
-                        }
+                        return FStringToUtf8(*name);
                     }
                 }
             }
 
-            if (FProperty* prop = player_state->GetPropertyByNameInChain(STR("PlayerName")))
-            {
-                if (FString* name = prop->ContainerPtrToValuePtr<FString>(player_state))
-                {
-                    std::string utf8 = FStringToUtf8(*name);
-                    if (!utf8.empty())
-                    {
-                        return utf8;
-                    }
-                }
-            }
-
-            return "Unknown";
+            return ReadPlayerNameProperty(player_state);
         }
 
-        // APalPlayerState::GuildBelongTo -> UPalGroupGuildBase::GetGuildName / GuildName
+        // APalPlayerState::GuildBelongTo -> UPalGroupGuildBase::GuildName (property only).
         std::string ReadGuildName(UObject* player_state)
         {
             if (!player_state)
@@ -141,24 +147,6 @@ namespace PalCrosschat
             if (!guild)
             {
                 return {};
-            }
-
-            if (UFunction* fn = guild->GetFunctionByNameInChain(STR("GetGuildName")))
-            {
-                const auto size = fn->GetParmsSize();
-                std::vector<uint8> buf(size > 0 ? size : sizeof(FString), 0);
-                guild->ProcessEvent(fn, buf.data());
-                if (FProperty* ret = fn->GetReturnProperty())
-                {
-                    if (FString* name = ret->ContainerPtrToValuePtr<FString>(buf.data()))
-                    {
-                        std::string utf8 = FStringToUtf8(*name);
-                        if (!utf8.empty())
-                        {
-                            return utf8;
-                        }
-                    }
-                }
             }
 
             if (FProperty* prop = guild->GetPropertyByNameInChain(STR("GuildName")))
@@ -419,26 +407,12 @@ namespace PalCrosschat
             return !out_platform.empty() && !out_user_id.empty();
         }
 
+        // Property read only — used from EnterChat_Receive. Do not ProcessEvent
+        // GetPlayerUId here (nested PE crashes the dedicated server).
         bool TryReadPlayerUId(UObject* controller, UObject* player_state, FGuid& out_guid)
         {
             out_guid = FGuid{};
-            if (controller)
-            {
-                if (UFunction* fn = controller->GetFunctionByNameInChain(STR("GetPlayerUId")))
-                {
-                    const auto size = fn->GetParmsSize();
-                    std::vector<uint8> buf(size > 0 ? size : sizeof(FGuid), 0);
-                    controller->ProcessEvent(fn, buf.data());
-                    if (FProperty* ret = fn->GetReturnProperty())
-                    {
-                        if (FGuid* guid = ret->ContainerPtrToValuePtr<FGuid>(buf.data()))
-                        {
-                            out_guid = *guid;
-                            return out_guid != FGuid{};
-                        }
-                    }
-                }
-            }
+            (void)controller;
 
             if (player_state)
             {
@@ -675,6 +649,27 @@ namespace PalCrosschat
             return false;
         }
 
+        // Overwrite the Category byte param in place. Plain byte in Locals — no
+        // allocator involved, unlike the Message FString.
+        bool TrySetCategory(UnrealScriptFunctionCallableContext& context, uint8 new_category)
+        {
+            UFunction* fn = context.TheStack.Node();
+            void* locals = context.TheStack.Locals();
+            if (!fn || !locals)
+            {
+                return false;
+            }
+            if (FProperty* cat_prop = fn->FindProperty(FName(STR("Category"), FNAME_Find)))
+            {
+                if (uint8* cat = cat_prop->ContainerPtrToValuePtr<uint8>(locals))
+                {
+                    *cat = new_category;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         bool ReadPlayerUIdProperty(UObject* player_state, FGuid& out_guid)
         {
             out_guid = FGuid{};
@@ -708,13 +703,15 @@ namespace PalCrosschat
                              LinkQueue& link_jobs,
                              WebhookWorker* webhook,
                              WordFilter* filter,
-                             ChatInject* inject)
+                             ChatInject* inject,
+                             AudienceTracker* audience)
         : m_config(config),
           m_outbound(outbound),
           m_link_jobs(link_jobs),
           m_webhook(webhook),
           m_filter(filter),
-          m_inject(inject)
+          m_inject(inject),
+          m_audience(audience)
     {
     }
 
@@ -793,6 +790,30 @@ namespace PalCrosschat
         }
     }
 
+    std::string ChatCapture::LookupCachedPlayerName(const std::string& uid_key) const
+    {
+        if (uid_key.empty())
+        {
+            return {};
+        }
+        std::lock_guard lock(m_name_cache_mutex);
+        if (auto it = m_name_by_player_uid.find(uid_key); it != m_name_by_player_uid.end())
+        {
+            return it->second;
+        }
+        return {};
+    }
+
+    void ChatCapture::CachePlayerName(const std::string& uid_key, const std::string& name)
+    {
+        if (uid_key.empty() || name.empty() || name == "Unknown")
+        {
+            return;
+        }
+        std::lock_guard lock(m_name_cache_mutex);
+        m_name_by_player_uid[uid_key] = name;
+    }
+
     void ChatCapture::ProcessSetDiscord(UObject* controller, const std::string& connect_code)
     {
         if (!controller)
@@ -800,10 +821,9 @@ namespace PalCrosschat
             return;
         }
 
-        // No GetPlayerName / SendScreenLog ProcessEvent here — those have crashed this server.
+        // Safe here: FlushDeferred / on_update, not nested inside EnterChat_Receive.
         UObject* player_state = GetPlayerState(controller);
-        const std::string raw_account = ReadAccountName(player_state);
-        std::string sender_name = SanitizeMessage(raw_account, 64);
+        std::string sender_name = SanitizeMessage(ResolvePlayerNameViaPE(player_state), 64);
         if (sender_name.empty())
         {
             sender_name = "Unknown";
@@ -813,6 +833,7 @@ namespace PalCrosschat
         FGuid player_uid{};
         const bool have_uid = ReadPlayerUIdProperty(player_state, player_uid);
         const std::string uid_key = have_uid ? FormatGuid(player_uid) : std::string{};
+        CachePlayerName(uid_key, sender_name);
 
         std::string platform_user_id;
         if (!uid_key.empty())
@@ -832,6 +853,10 @@ namespace PalCrosschat
                 m_platform_by_player_uid[uid_key] = platform_user_id;
             }
         }
+        if (!platform_user_id.empty() && have_uid && m_audience)
+        {
+            m_audience->Remember(player_uid, platform_user_id);
+        }
 
         std::string platform;
         std::string user_id;
@@ -840,7 +865,7 @@ namespace PalCrosschat
         {
             Output::send<LogLevel::Warning>(
                 STR("[PalCrosschat] !setdiscord failed: no platform id (AccountName='{}')\n"),
-                RC::ensure_str(raw_account));
+                RC::ensure_str(ReadAccountName(player_state)));
             return;
         }
 
@@ -909,6 +934,55 @@ namespace PalCrosschat
         }
     }
 
+    void ChatCapture::FlushPendingChatRelays()
+    {
+        for (;;)
+        {
+            PendingChatRelay pending;
+            {
+                std::lock_guard lock(m_pending_mutex);
+                if (m_pending_chat_relays.empty())
+                {
+                    return;
+                }
+                pending = std::move(m_pending_chat_relays.front());
+                m_pending_chat_relays.pop_front();
+            }
+
+            UObject* controller = pending.controller.Get();
+            UObject* player_state = GetPlayerState(controller);
+            std::string sender_name = SanitizeMessage(ResolvePlayerNameViaPE(player_state), 64);
+            if (sender_name.empty())
+            {
+                sender_name = LookupCachedPlayerName(pending.sender_id);
+            }
+            if (sender_name.empty())
+            {
+                sender_name = "Unknown";
+            }
+            else
+            {
+                CachePlayerName(pending.sender_id, sender_name);
+            }
+
+            if (pending.local_tag && m_inject)
+            {
+                m_inject->EnqueueLocalTagged(sender_name,
+                                             pending.guild_name,
+                                             pending.message,
+                                             pending.category,
+                                             pending.sender_uid);
+            }
+
+            OutboundMessage outbound;
+            outbound.sender_name = std::move(sender_name);
+            outbound.sender_id = std::move(pending.sender_id);
+            outbound.guild_name = std::move(pending.guild_name);
+            outbound.message = std::move(pending.message);
+            m_outbound.Push(std::move(outbound));
+        }
+    }
+
     void ChatCapture::FlushDeferred()
     {
         for (;;)
@@ -918,7 +992,7 @@ namespace PalCrosschat
                 std::lock_guard lock(m_pending_mutex);
                 if (m_pending_setdiscord.empty())
                 {
-                    return;
+                    break;
                 }
                 pending = std::move(m_pending_setdiscord.front());
                 m_pending_setdiscord.pop_front();
@@ -934,6 +1008,8 @@ namespace PalCrosschat
                     STR("[PalCrosschat] !setdiscord: player left before link completed\n"));
             }
         }
+
+        FlushPendingChatRelays();
     }
 
     void ChatCapture::HandleHook(UnrealScriptFunctionCallableContext& context)
@@ -981,15 +1057,33 @@ namespace PalCrosschat
         }
 
         UObject* player_state = GetPlayerState(controller);
-        std::string sender_name = SanitizeMessage(ReadPlayerName(player_state), 64);
-        if (sender_name.empty())
-        {
-            sender_name = "Unknown";
-        }
         FGuid sender_uid{};
         const std::string sender_id =
             TryReadPlayerUId(controller, player_state, sender_uid) ? FormatGuid(sender_uid)
                                                                    : std::string{};
+
+        // Never GetPlayerName here (nested PE crashes). Property is usually empty on
+        // dedicated — use cache, else defer relay to FlushDeferred for PE resolve.
+        std::string sender_name = SanitizeMessage(ReadPlayerNameProperty(player_state), 64);
+        if (sender_name.empty())
+        {
+            sender_name = LookupCachedPlayerName(sender_id);
+        }
+        const bool have_display_name = !sender_name.empty();
+        if (!have_display_name)
+        {
+            sender_name = "Unknown";
+        }
+
+        // Cache platform for dual-broadcast audience splits (AccountName only — no PE).
+        if (m_audience && !(sender_uid == FGuid{}))
+        {
+            if (std::string platform = NormalizePlatformUserId(ReadAccountName(player_state));
+                !platform.empty())
+            {
+                m_audience->Remember(sender_uid, platform);
+            }
+        }
         const std::string mute_key = !sender_id.empty() ? sender_id : sender_name;
 
         auto show_mute_banner = [&](const std::string& banner) {
@@ -1096,15 +1190,38 @@ namespace PalCrosschat
             }
         }
 
+        // Command gate ('/', '!'): hide from chat and keep out of the DB/Discord, but
+        // leave the Message text intact — PalDefender reads it from this same function
+        // AFTER our pre-hook and executes real commands (in-place truncation starved
+        // it: v1.73/v1.75). Parking Category as None stops clients from displaying
+        // the line while PalDefender still executes it (verified in v1.76). PalDefender
+        // does NOT empty consumed commands, so real and fake are indistinguishable
+        // here — never rebroadcast a command line (v1.76 showed /adminlogin passwords
+        // formatted in public chat). Unknown commands simply vanish.
+        if (message.front() == '/' || message.front() == '!')
+        {
+            if (!TrySetCategory(context, CHAT_CATEGORY_NONE) && m_config.debug_verbose)
+            {
+                Output::send<LogLevel::Warning>(
+                    STR("[PalCrosschat] Command park failed (no Category param)\n"));
+            }
+            if (m_config.debug_verbose)
+            {
+                Output::send<LogLevel::Normal>(
+                    STR("[PalCrosschat] Command line parked (hidden, not relayed): {}\n"),
+                    RC::ensure_str(TruncateForLog(message, 80)));
+            }
+            return;
+        }
+
         // Chat channel trace: confirms which EPalChatCategory the server actually sees
         // per line, so a "guild chat reached Discord" report can be traced to either a
         // misread category byte or a different mod's relay.
         if (m_config.debug_verbose)
         {
             Output::send<LogLevel::Normal>(
-                STR("[PalCrosschat] CHAT pal_cat={} db_cat={} relayed={} sender={} msg={}\n"),
+                STR("[PalCrosschat] CHAT pal_cat={} relayed={} sender={} msg={}\n"),
                 static_cast<int>(category),
-                static_cast<int>(ToDbChatCategory(category)),
                 IsRelayedCategory(category) ? 1 : 0,
                 RC::ensure_str(sender_name),
                 RC::ensure_str(TruncateForLog(message, 80)));
@@ -1139,11 +1256,14 @@ namespace PalCrosschat
         // Queue only — ProcessEvent runs from on_update after this hook returns.
         // Do NOT hook BroadcastChatMessage — join/system chat uses const FPalChatMessage& and
         // mutating Locals there crashes the dedicated server.
-        if (m_config.show_local_server_tag && m_inject)
+        // Only Global: Say's audience is decided by the game, and Guild reformats are
+        // unworkable (nil sender uid — required for a custom Sender — makes clients
+        // drop guild-category lines; see v1.67-1.70 history).
+        const bool local_tag =
+            m_config.show_local_server_tag && m_inject && category == CHAT_CATEGORY_GLOBAL;
+
+        if (local_tag)
         {
-            // sender_uid keeps the rebroadcast attributable to the real player; console
-            // clients mask the body of chat whose SenderPlayerUId is empty.
-            m_inject->EnqueueLocalTagged(sender_name, guild_name, message, category, sender_uid);
             if (!TryClearMessage(context) && m_config.debug_verbose)
             {
                 Output::send<LogLevel::Warning>(
@@ -1151,12 +1271,38 @@ namespace PalCrosschat
             }
         }
 
+        // Display name needs GetPlayerName PE — defer one tick when cache/property miss.
+        if (!have_display_name)
+        {
+            PendingChatRelay pending{};
+            pending.controller = controller;
+            pending.message = std::move(message);
+            pending.guild_name = guild_name;
+            pending.sender_id = sender_id;
+            pending.sender_uid = sender_uid;
+            pending.category = category;
+            pending.local_tag = local_tag;
+            {
+                std::lock_guard lock(m_pending_mutex);
+                if (m_pending_chat_relays.size() >= 64)
+                {
+                    m_pending_chat_relays.pop_front();
+                }
+                m_pending_chat_relays.push_back(std::move(pending));
+            }
+            return;
+        }
+
+        if (local_tag)
+        {
+            m_inject->EnqueueLocalTagged(sender_name, guild_name, message, category, sender_uid);
+        }
+
         OutboundMessage outbound;
         outbound.sender_name = std::move(sender_name);
         outbound.sender_id = std::move(sender_id);
         outbound.guild_name = guild_name;
         outbound.message = std::move(message);
-        outbound.category = ToDbChatCategory(category);
 
         // THREAD BOUNDARY: game thread -> outbound queue (plain structs only). No MySQL here.
         m_outbound.Push(std::move(outbound));

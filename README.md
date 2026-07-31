@@ -97,7 +97,7 @@ cmake --build build --config Game__Shipping__Win64
 | ChatFormat | Format | `[{prefix}] [{guild}] {player}: {message}` | In-game crosschat line template. Placeholders: `{prefix}`, `{guild}`, `{player}`, `{message}`. Empty guild removes stray `[]`. Split into Sender + Message for Palworld’s `[Sender]:Message` UI (expect a `]` before `:` — same as native `[Name]: text`). |
 | InjectCategory | Format | `global` | `global` (1) or `discord` (4). |
 | ShowLocalServerTag | Format | `false` | When `true`, local Global chat is cleared and rebroadcast using `ChatFormat` (same look as cross-server). |
-| PreserveSenderUId | Format | `true` | Stamps injected chat with the sender's real `PlayerUId`. Console (Xbox) clients mask the body of chat they cannot attribute to a sender, so with `false` every relayed line shows as `***` for them. |
+| PreserveSenderUId | Format | `false` | Legacy (v1.78). Unused by dual broadcast (v1.79+). Kept for config compatibility. |
 | LogWebhookUrl | ChatFilter | `""` | Optional Discord webhook URL for mute/block logs. Empty disables. |
 | InitialMuteNotification | ChatFilter | `You have been muted for {mutetime}!` | Banner title line on first mute. Placeholders: `{mutetime}`, `{mutemessage}`, `{remainingtime}`. |
 | ActiveMuteNotification | ChatFilter | `You are muted! Time remaining: {remainingtime}` | Banner title when a muted player chats again (no MuteMessage). Placeholder: `{remainingtime}`. |
@@ -122,23 +122,65 @@ Cross-server and Discord messages are filtered again on inject (`BroadcastChatMe
 
 Tables already exist (do not create them from this mod):
 
-- `crosschat_messages(id, origin, sender_name, sender_id, guild_name, message, category, created_at)`
+- `crosschat_messages(id, origin, sender_name, sender_id, guild_name, message, created_at)`
 - `crosschat_cursors(consumer, last_id)`
 - `crosschat_players(DiscordId, Platform, UserId, PlatformUserId, PlayerName, LinkedAt, ConnectCode)` — Discord linking
 
-This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ? AND category = 0`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
+This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ?`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
 
-### Chat channel (`category`)
+### Chat channels
 
-`category` records which in-game channel a line came from: `0` global, `1` guild, `2` say
-(mapped from `EPalChatCategory` so the DB contract survives a game enum renumber). Only
-`category = 0` is forwarded — both by this mod's inbound poll and by CrosschatBot — so guild
-and say chat can never surface on another server or in Discord.
+Only **Global** chat is relayed: every `crosschat_messages` row is forwarded to the other
+servers and Discord, so global is the only channel ever written there.
 
-The mod itself still only relays global chat (`RELAYED_CATEGORIES`), so guild/say lines
-normally never reach MySQL at all; the column is the enforcement point for every consumer.
-With `DebugVerbose`, each chat line logs `CHAT pal_cat=… db_cat=… relayed=…`, which is the
+- **Global** — with `ShowLocalServerTag: true`, suppressed and rebroadcast with
+  `ChatFormat`, visible to everyone; relayed to the DB.
+- **Guild** — completely untouched: native green display, native audience, never leaves
+  the server. (Reformatting guild chat is unworkable: clients discard Category=Guild
+  lines whose `SenderPlayerUId` is nil, and a nil uid is required for a custom Sender
+  string to render — see the v1.67–1.70 history.)
+- **Say** — completely untouched and never leaves the server.
+
+With `DebugVerbose`, each chat line logs `CHAT pal_cat=… relayed=…`, which is the
 quickest way to confirm what channel the server actually saw for a given message.
+
+### Xbox / console dual broadcast (v1.79+, fixed v1.82)
+
+Custom `ChatFormat` Sender tags require a nil `SenderPlayerUId`; Xbox clients mask
+chat bodies they cannot attribute. Injected/rebroadcast lines split via
+`ReceiverPlayerUIds`:
+
+- **steam_ / ps5_** — formatted Sender tags (`[EU][WOWZERS][Name]: hello`, nil uid).
+- **gdk_ or unknown platform** — attributed layout (tags in Message, real
+  `SenderPlayerUId`) so Xbox can show the body. Unknown defaults here because
+  dedicated often leaves Xbox `AccountName` empty (v1.82).
+
+With only known Steam/PS5 online, only the formatted broadcast runs. Platform is
+cached from `AccountName` on chat / `!setdiscord`. Discord → game rows have no
+Palworld `PlayerUId`, so Xbox may still mask those lines.
+
+### Command handling
+
+Chat lines starting with `/` or `!` (any chat mode) are hidden from chat and
+**never written to the DB** — so commands (including `/adminlogin` and its
+password) never show anywhere and never reach Discord or other servers.
+
+Mechanism (v1.77): the pre-hook rewrites the `Category` byte to `None` (safe
+in-place byte write) and leaves the Message text **intact**. Clients don't display
+None-category chat, while PalDefender — which reads the command from the same
+`EnterChat_Receive` parameters after this mod's pre-hook — still receives and
+executes real commands (verified: `/adminlogin` works while parked). Two hard-won
+rules encoded here:
+
+- Never truncate a command line's Message: PalDefender gets an empty string and
+  real commands stop executing (v1.73/v1.75).
+- Never rebroadcast a command line: PalDefender does not empty consumed commands,
+  so real and fake commands are indistinguishable, and v1.76 ended up formatting
+  `/adminlogin <password>` into public chat.
+
+A mistyped ("fake") command therefore just vanishes silently. The only command
+parsed by this mod is its own `!setdiscord` (suppressed + private reply). The bot
+likewise never relays `/`- or `!`-prefixed Discord messages into the game.
 
 ### Discord `!setdiscord`
 
@@ -151,14 +193,16 @@ When a player types `!setdiscord CODE` in chat (`!` avoids PalDefender `/` admin
 3. It looks up `ConnectCode` on `crosschat_players` and completes the link (or reports already linked / invalid code).
 4. A private chat line reports the result to that player only.
 
-Codes are created by the CrosschatBot **Link Discord** panel button.
+Codes are created by the PalCrosschatBot **Link Discord** panel button.
 
-Before running 1.66, add the `category` column (the mod's INSERT and poll both use it):
+If your DB still has the `category` column (added for v1.66, removed in v1.72 — only
+global chat is written to the table now, so the label is dead weight), drop it:
 
 ```sql
+DELETE FROM crosschat_messages WHERE category <> 0;
 ALTER TABLE crosschat_messages
-  ADD COLUMN category TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER message,
-  ADD KEY idx_category_id (category, id);
+  DROP KEY idx_category_id,
+  DROP COLUMN category;
 ```
 
 If you already have the tables without `guild_name`, run:

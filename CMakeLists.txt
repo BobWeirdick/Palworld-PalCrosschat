@@ -63,6 +63,7 @@ add_library(${TARGET} SHARED
     src/Config.cpp
     src/Sanitize.cpp
     src/DbWorker.cpp
+    src/Audience.cpp
     src/ChatCapture.cpp
     src/ChatFormat.cpp
     src/ChatInject.cpp

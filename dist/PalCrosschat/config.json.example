@@ -21,7 +21,7 @@
     "ChatFormat": "[{prefix}] [{guild}] {player}: {message}",
     "InjectCategory": "global",
     "ShowLocalServerTag": false,
-    "PreserveSenderUId": true
+    "PreserveSenderUId": false
   },
   "ChatFilter": {
     "LogWebhookUrl": "",

@@ -1,3 +1,4 @@
+#include "Audience.h"
 #include "ChatCapture.h"
 #include "ChatInject.h"
 #include "Config.h"
@@ -20,11 +21,13 @@ public:
     PalCrosschatMod() : CppUserModBase()
     {
         ModName = STR("PalCrosschat");
-        ModVersion = STR("1.66");
+        ModVersion = STR("1.82");
         ModDescription = STR("Relays Palworld chat to MySQL, injects cross-server messages, Discord !setdiscord link");
         ModAuthors = STR("ARKADE");
 
         m_config = LoadConfig();
+        Output::send<LogLevel::Normal>(
+            STR("[PalCrosschat] Version {}\n"), ModVersion);
         LogConfigSummary(m_config);
 
         if (!m_config.enabled)
@@ -40,11 +43,17 @@ public:
         m_link_results = std::make_unique<LinkResultQueue>(kQueueMax, "link_results");
         m_webhook = std::make_unique<WebhookWorker>();
         m_filter = std::make_unique<WordFilter>(m_config);
+        m_audience = std::make_unique<AudienceTracker>();
         m_db = std::make_unique<DbWorker>(
             m_config, *m_outbound, *m_inbound, *m_link_jobs, *m_link_results);
-        m_inject = std::make_unique<ChatInject>(m_config, m_filter.get());
-        m_capture = std::make_unique<ChatCapture>(
-            m_config, *m_outbound, *m_link_jobs, m_webhook.get(), m_filter.get(), m_inject.get());
+        m_inject = std::make_unique<ChatInject>(m_config, m_filter.get(), m_audience.get());
+        m_capture = std::make_unique<ChatCapture>(m_config,
+                                                  *m_outbound,
+                                                  *m_link_jobs,
+                                                  m_webhook.get(),
+                                                  m_filter.get(),
+                                                  m_inject.get(),
+                                                  m_audience.get());
 
         if (!m_config.mute_log_webhook.empty() && !m_config.filter_patterns.empty())
         {
@@ -125,6 +134,7 @@ private:
     std::unique_ptr<LinkResultQueue> m_link_results;
     std::unique_ptr<WebhookWorker> m_webhook;
     std::unique_ptr<WordFilter> m_filter;
+    std::unique_ptr<AudienceTracker> m_audience;
     std::unique_ptr<DbWorker> m_db;
     std::unique_ptr<ChatInject> m_inject;
     std::unique_ptr<ChatCapture> m_capture;

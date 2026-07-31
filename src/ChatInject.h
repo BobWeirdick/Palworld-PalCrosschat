@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Audience.h"
 #include "Config.h"
 #include "Queues.h"
 
@@ -7,7 +8,9 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <vector>
 
+#include <Unreal/Core/HAL/Platform.hpp>
 #include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/UnrealCoreStructs.hpp>
 
@@ -25,14 +28,14 @@ namespace PalCrosschat
     class ChatInject
     {
     public:
-        ChatInject(const Config& config, WordFilter* filter);
+        ChatInject(const Config& config, WordFilter* filter, AudienceTracker* audience);
         ~ChatInject() = default;
 
         // Drain deferred hook work, then up to MaxBroadcastsPerTick from inbound.
         // Call only from on_update (game thread).
         void Drain(InboundQueue& inbound, int max_per_tick);
 
-        // Queue a local Global rebroadcast with this server's ChatFormat prefix.
+        // Queue a local rebroadcast with this server's ChatFormat prefix.
         // Safe to call from EnterChat_Receive (no ProcessEvent here).
         void EnqueueLocalTagged(const std::string& sender_name,
                                 const std::string& guild_name,
@@ -67,8 +70,8 @@ namespace PalCrosschat
             std::string message;
             uint8_t category = 0;
             RC::Unreal::FWeakObjectPtr controller{};
-            RC::Unreal::FGuid receiver_uid{};
-            bool has_receiver = false;
+            // Empty = broadcast to everyone.
+            std::vector<RC::Unreal::FGuid> receivers{};
             RC::Unreal::FGuid sender_uid{};
         };
 
@@ -80,13 +83,20 @@ namespace PalCrosschat
         bool BroadcastDisplay(const std::string& display_sender,
                               const std::string& message,
                               uint8_t category,
-                              const RC::Unreal::FGuid* receiver_only = nullptr,
+                              const std::vector<RC::Unreal::FGuid>* receivers = nullptr,
                               const RC::Unreal::FGuid* sender_player_uid = nullptr);
         bool BroadcastLocalTagged(const std::string& sender_name,
                                   const std::string& guild_name,
                                   const std::string& message,
                                   uint8_t category,
                                   const RC::Unreal::FGuid& sender_player_uid);
+        // Formatted+nil uid to steam_/ps5_; attributed+real uid to Xbox/unknown when present.
+        bool BroadcastDual(const std::string& xbox_sender,
+                           const std::string& xbox_message,
+                           const std::string& formatted_sender,
+                           const std::string& formatted_message,
+                           uint8_t category,
+                           const RC::Unreal::FGuid* sender_player_uid);
         bool ShowServerNotice(const std::string& notice_message);
         bool SendScreenLog(RC::Unreal::UObject* player_controller, const std::string& message);
 
@@ -95,6 +105,7 @@ namespace PalCrosschat
 
         const Config& m_config;
         WordFilter* m_filter = nullptr;
+        AudienceTracker* m_audience = nullptr;
         RC::Unreal::FWeakObjectPtr m_game_state{};
         RC::Unreal::UFunction* m_broadcast_fn = nullptr;
         RC::Unreal::UFunction* m_server_notice_fn = nullptr;

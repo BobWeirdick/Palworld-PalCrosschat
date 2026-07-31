@@ -132,8 +132,8 @@ namespace PalCrosschat
         }
     }
 
-    ChatInject::ChatInject(const Config& config, WordFilter* filter)
-        : m_config(config), m_filter(filter)
+    ChatInject::ChatInject(const Config& config, WordFilter* filter, AudienceTracker* audience)
+        : m_config(config), m_filter(filter), m_audience(audience)
     {
     }
 
@@ -248,7 +248,7 @@ namespace PalCrosschat
     bool ChatInject::BroadcastDisplay(const std::string& display_sender,
                                       const std::string& message,
                                       uint8_t category,
-                                      const FGuid* receiver_only,
+                                      const std::vector<FGuid>* receivers,
                                       const FGuid* sender_player_uid)
     {
         UObject* game_state = ResolveGameState();
@@ -268,12 +268,13 @@ namespace PalCrosschat
         }
 
         {
-            // Console (Xbox) clients run received chat through Palworld's word-filter
-            // service and mask the body when the sender cannot be identified, so an
-            // empty SenderPlayerUId shows every injected line as "***".
+            // Non-nil SenderPlayerUId: console (Xbox) clients can attribute the line
+            // (nil uid → body masked as ***). The game then ignores our Sender string
+            // and shows the resolved player name. Dual-broadcast callers pass a uid only
+            // on the Xbox plain path; formatted PC path passes nullptr. Unresolvable
+            // non-nil uids render as "------" (v1.68); only pass real PlayerUIds.
             FGuid* uid = std::bit_cast<FGuid*>(chat + m_off_sender_uid);
-            *uid = (sender_player_uid && m_config.preserve_sender_uid) ? *sender_player_uid
-                                                                      : FGuid{};
+            *uid = sender_player_uid ? *sender_player_uid : FGuid{};
         }
 
         {
@@ -281,10 +282,13 @@ namespace PalCrosschat
             *message_fs = FString(Utf8ToUe(message));
         }
 
-        if (receiver_only)
+        if (receivers && !receivers->empty())
         {
-            auto* receivers = std::bit_cast<TArray<FGuid>*>(chat + m_off_receivers);
-            receivers->Add(*receiver_only);
+            auto* receiver_array = std::bit_cast<TArray<FGuid>*>(chat + m_off_receivers);
+            for (const FGuid& uid : *receivers)
+            {
+                receiver_array->Add(uid);
+            }
         }
 
         // MessageArgKeys / MessageArgValues: leave empty (InitializeStruct).
@@ -366,8 +370,7 @@ namespace PalCrosschat
         DeferredAction action{};
         action.kind = DeferredKind::PrivateChat;
         action.message = message;
-        action.receiver_uid = receiver_player_uid;
-        action.has_receiver = true;
+        action.receivers = {receiver_player_uid};
         action.category = CHAT_CATEGORY_GLOBAL;
 
         std::lock_guard lock(m_deferred_mutex);
@@ -412,10 +415,10 @@ namespace PalCrosschat
                 }
                 break;
             case DeferredKind::PrivateChat:
-                if (action.has_receiver)
+                if (!action.receivers.empty())
                 {
                     BroadcastDisplay(
-                        "PalCrosschat", action.message, action.category, &action.receiver_uid);
+                        "PalCrosschat", action.message, action.category, &action.receivers);
                 }
                 break;
             }
@@ -450,12 +453,66 @@ namespace PalCrosschat
         {
             return false;
         }
+        auto [xbox_sender, xbox_message] = ApplyChatFormatAttributed(
+            m_config.chat_format, prefix, clean_guild, clean_sender, clean_message);
+        if (xbox_message.empty())
+        {
+            xbox_message = clean_message;
+        }
         const bool have_sender_uid = !(sender_player_uid == FGuid{});
-        return BroadcastDisplay(display_sender,
-                                display_message,
-                                category,
-                                nullptr,
-                                have_sender_uid ? &sender_player_uid : nullptr);
+        return BroadcastDual(xbox_sender,
+                             xbox_message,
+                             display_sender,
+                             display_message,
+                             category,
+                             have_sender_uid ? &sender_player_uid : nullptr);
+    }
+
+    bool ChatInject::BroadcastDual(const std::string& xbox_sender,
+                                   const std::string& xbox_message,
+                                   const std::string& formatted_sender,
+                                   const std::string& formatted_message,
+                                   uint8_t category,
+                                   const FGuid* sender_player_uid)
+    {
+        std::vector<FGuid> xbox;
+        std::vector<FGuid> others;
+        if (m_audience)
+        {
+            m_audience->Collect(xbox, others);
+        }
+
+        if (m_config.debug_verbose)
+        {
+            Output::send<LogLevel::Normal>(
+                STR("[PalCrosschat] BroadcastDual xbox={} others={} have_uid={}\n"),
+                static_cast<int>(xbox.size()),
+                static_cast<int>(others.size()),
+                sender_player_uid ? 1 : 0);
+        }
+
+        if (xbox.empty())
+        {
+            // No Xbox/unknown online — one formatted broadcast to everyone.
+            return BroadcastDisplay(
+                formatted_sender, formatted_message, category, nullptr, nullptr);
+        }
+
+        // Xbox/unknown present: formatted+nil to steam_/ps5_; attributed+real uid to rest.
+        bool ok = true;
+        if (!others.empty())
+        {
+            ok = BroadcastDisplay(
+                     formatted_sender, formatted_message, category, &others, nullptr) &&
+                 ok;
+        }
+        ok = BroadcastDisplay(xbox_sender,
+                              xbox_message,
+                              category,
+                              &xbox,
+                              sender_player_uid) &&
+             ok;
+        return ok;
     }
 
     bool ChatInject::EnsureServerNoticeFunction()
@@ -634,16 +691,23 @@ namespace PalCrosschat
         {
             display_message = clean_message;
         }
+        auto [xbox_sender, xbox_message] = ApplyChatFormatAttributed(
+            m_config.chat_format, prefix, clean_guild, clean_sender, clean_message);
+        if (xbox_message.empty())
+        {
+            xbox_message = clean_message;
+        }
 
-        // Carry the origin server's PlayerUId when we have one (Discord rows have none):
-        // console clients mask chat bodies they cannot attribute to a sender.
+        // Origin server's PlayerUId when present (Discord rows have none): Xbox
+        // attributed path needs it; formatted PC path uses nil uid.
         FGuid sender_uid{};
         const bool have_sender_uid = TryParseGuid(msg.sender_id, sender_uid);
-        return BroadcastDisplay(display_sender,
-                                display_message,
-                                m_config.inject_category,
-                                nullptr,
-                                have_sender_uid ? &sender_uid : nullptr);
+        return BroadcastDual(xbox_sender,
+                             xbox_message,
+                             display_sender,
+                             display_message,
+                             m_config.inject_category,
+                             have_sender_uid ? &sender_uid : nullptr);
     }
 
     void ChatInject::Drain(InboundQueue& inbound, int max_per_tick)

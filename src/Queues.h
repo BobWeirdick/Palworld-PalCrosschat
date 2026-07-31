@@ -19,8 +19,6 @@ namespace PalCrosschat
         std::string sender_id;
         std::string guild_name;
         std::string message;
-        // crosschat_messages.category (0=global, 1=guild, 2=say).
-        uint8_t category = 0;
     };
 
     struct InboundMessage
