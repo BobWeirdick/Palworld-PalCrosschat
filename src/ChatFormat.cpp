@@ -153,9 +153,8 @@ namespace PalCrosschat
         std::string_view player,
         std::string_view message)
     {
-        // Xbox / unknown-platform path: plain body + real SenderPlayerUId so the client
-        // can attribute the line. Do not inject ChatFormat tags (those need nil uid and
-        // get masked on Xbox). Renders as [PlayerName]:message.
+        // Xbox path: native [Name]: hello only — no ChatFormat tags (those need nil uid
+        // and get masked, or look wrong when stuffed into Message).
         const std::string sender = player.empty() ? "Unknown" : std::string(player);
         return {sender, std::string(message)};
     }

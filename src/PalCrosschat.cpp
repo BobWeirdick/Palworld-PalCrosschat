@@ -21,7 +21,7 @@ public:
     PalCrosschatMod() : CppUserModBase()
     {
         ModName = STR("PalCrosschat");
-        ModVersion = STR("1.83");
+        ModVersion = STR("1.84");
         ModDescription = STR("Relays Palworld chat to MySQL, injects cross-server messages, Discord !setdiscord link");
         ModAuthors = STR("ARKADE");
 

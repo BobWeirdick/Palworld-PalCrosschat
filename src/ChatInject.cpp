@@ -478,7 +478,16 @@ namespace PalCrosschat
         std::vector<FGuid> others;
         if (m_audience)
         {
+            // Fill steam_/gdk_ cache for players with empty AccountName (SEH UniqueNetId).
+            m_audience->WarmUnknownPlatforms(4);
             m_audience->Collect(xbox, others);
+        }
+
+        // Remote / non-local PlayerUIds render as "------" — only attribute local senders.
+        const FGuid* xbox_uid = nullptr;
+        if (sender_player_uid && m_audience && m_audience->IsOnlinePlayerUid(*sender_player_uid))
+        {
+            xbox_uid = sender_player_uid;
         }
 
         if (m_config.debug_verbose)
@@ -487,17 +496,17 @@ namespace PalCrosschat
                 STR("[PalCrosschat] BroadcastDual xbox={} others={} have_uid={}\n"),
                 static_cast<int>(xbox.size()),
                 static_cast<int>(others.size()),
-                sender_player_uid ? 1 : 0);
+                xbox_uid ? 1 : 0);
         }
 
         if (xbox.empty())
         {
-            // No Xbox/unknown online — one formatted broadcast to everyone.
+            // No known Xbox online — one formatted broadcast to everyone (Steam/PC).
             return BroadcastDisplay(
                 formatted_sender, formatted_message, category, nullptr, nullptr);
         }
 
-        // Xbox/unknown present: formatted+nil to steam_/ps5_; plain+real uid to rest.
+        // gdk_ present: formatted+nil to everyone else; attributed+local uid to Xbox.
         bool ok = true;
         if (!others.empty())
         {
@@ -505,12 +514,15 @@ namespace PalCrosschat
                      formatted_sender, formatted_message, category, &others, nullptr) &&
                  ok;
         }
-        ok = BroadcastDisplay(xbox_sender,
-                              xbox_message,
-                              category,
-                              &xbox,
-                              sender_player_uid) &&
-             ok;
+        if (xbox_uid)
+        {
+            ok = BroadcastDisplay(xbox_sender, xbox_message, category, &xbox, xbox_uid) && ok;
+        }
+        else
+        {
+            // Cross-server/Discord: nil uid (avoids "------"); Xbox may still mask.
+            ok = BroadcastDisplay(xbox_sender, xbox_message, category, &xbox, nullptr) && ok;
+        }
         return ok;
     }
 

@@ -18,7 +18,7 @@
     "PrefixNA": "NA",
     "PrefixEU": "EU",
     "PrefixDiscord": "Discord",
-    "ChatFormat": "[{prefix}] [{guild}] {player}: {message}",
+    "ChatFormat": "[{prefix}][{guild}][{player}]: {message}",
     "InjectCategory": "global",
     "ShowLocalServerTag": false,
     "PreserveSenderUId": false

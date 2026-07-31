@@ -1,6 +1,6 @@
 #include "Audience.h"
+#include "PlatformId.h"
 
-#include <cctype>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -18,16 +18,6 @@ namespace PalCrosschat
 {
     namespace
     {
-        std::string FStringToUtf8(const FString& str)
-        {
-            const TCHAR* data = *str;
-            if (!data)
-            {
-                return {};
-            }
-            return RC::to_utf8_string(data);
-        }
-
         std::string FormatGuid(const FGuid& guid)
         {
             char buf[64]{};
@@ -43,43 +33,7 @@ namespace PalCrosschat
             return std::string(buf);
         }
 
-        std::string NormalizePlatformUserId(std::string raw)
-        {
-            while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.front())))
-            {
-                raw.erase(raw.begin());
-            }
-            while (!raw.empty() && std::isspace(static_cast<unsigned char>(raw.back())))
-            {
-                raw.pop_back();
-            }
-            if (raw.empty())
-            {
-                return {};
-            }
-            if (raw.rfind("steam_", 0) == 0 || raw.rfind("gdk_", 0) == 0 ||
-                raw.rfind("ps5_", 0) == 0)
-            {
-                return raw;
-            }
-            // Bare SteamID64 digits → steam_
-            bool digits = !raw.empty();
-            for (char c : raw)
-            {
-                if (c < '0' || c > '9')
-                {
-                    digits = false;
-                    break;
-                }
-            }
-            if (digits && raw.size() >= 15)
-            {
-                return "steam_" + raw;
-            }
-            return raw;
-        }
-
-        std::string ReadAccountName(UObject* player_state)
+        std::string ReadAccountNameProp(UObject* player_state)
         {
             if (!player_state)
             {
@@ -89,7 +43,11 @@ namespace PalCrosschat
             {
                 if (FString* name = prop->ContainerPtrToValuePtr<FString>(player_state))
                 {
-                    return FStringToUtf8(*name);
+                    const TCHAR* data = **name;
+                    if (data)
+                    {
+                        return RC::to_utf8_string(data);
+                    }
                 }
             }
             return {};
@@ -113,10 +71,9 @@ namespace PalCrosschat
             return false;
         }
 
-        bool IsKnownNonXboxPlatform(const std::string& platform_user_id)
+        bool IsXboxPlatform(const std::string& platform_user_id)
         {
-            return platform_user_id.rfind("steam_", 0) == 0 ||
-                   platform_user_id.rfind("ps5_", 0) == 0;
+            return platform_user_id.rfind("gdk_", 0) == 0;
         }
     }
 
@@ -135,13 +92,70 @@ namespace PalCrosschat
         m_platform_by_uid[FormatGuid(player_uid)] = normalized;
     }
 
+    void AudienceTracker::WarmUnknownPlatforms(int max_resolves)
+    {
+        if (max_resolves <= 0)
+        {
+            return;
+        }
+
+        std::vector<UObject*> states;
+        try
+        {
+            UObjectGlobals::FindAllOf(STR("PalPlayerState"), states);
+        }
+        catch (...)
+        {
+            return;
+        }
+
+        int resolved = 0;
+        for (UObject* state : states)
+        {
+            if (resolved >= max_resolves || !state)
+            {
+                break;
+            }
+
+            FGuid uid{};
+            if (!ReadPlayerUId(state, uid))
+            {
+                continue;
+            }
+
+            const std::string key = FormatGuid(uid);
+            {
+                std::lock_guard lock(m_mutex);
+                if (m_platform_by_uid.contains(key))
+                {
+                    continue;
+                }
+            }
+
+            const std::string platform = ResolvePlatformUserId(state);
+            if (platform.empty())
+            {
+                continue;
+            }
+            Remember(uid, platform);
+            ++resolved;
+        }
+    }
+
     void AudienceTracker::Collect(std::vector<FGuid>& xbox, std::vector<FGuid>& others)
     {
         xbox.clear();
         others.clear();
 
         std::vector<UObject*> states;
-        UObjectGlobals::FindAllOf(STR("PalPlayerState"), states);
+        try
+        {
+            UObjectGlobals::FindAllOf(STR("PalPlayerState"), states);
+        }
+        catch (...)
+        {
+            return;
+        }
 
         for (UObject* state : states)
         {
@@ -168,7 +182,8 @@ namespace PalCrosschat
 
             if (platform.empty())
             {
-                platform = NormalizePlatformUserId(ReadAccountName(state));
+                // Property-only peek (no PE). WarmUnknownPlatforms fills cache over ticks.
+                platform = NormalizePlatformUserId(ReadAccountNameProp(state));
                 if (!platform.empty())
                 {
                     std::lock_guard lock(m_mutex);
@@ -176,16 +191,44 @@ namespace PalCrosschat
                 }
             }
 
-            // Unknown/empty → xbox bucket. Dedicated often leaves AccountName empty for
-            // Xbox; putting unknowns on the formatted nil-UID path censors their chat.
-            if (IsKnownNonXboxPlatform(platform))
-            {
-                others.push_back(uid);
-            }
-            else
+            // Only known gdk_ → Xbox path. Unknown stays on formatted nil-UID (Steam/PC).
+            // Empty AccountName on Steam must NOT be treated as Xbox (v1.82 regression).
+            if (IsXboxPlatform(platform))
             {
                 xbox.push_back(uid);
             }
+            else
+            {
+                others.push_back(uid);
+            }
         }
+    }
+
+    bool AudienceTracker::IsOnlinePlayerUid(const FGuid& player_uid) const
+    {
+        if (player_uid == FGuid{})
+        {
+            return false;
+        }
+
+        std::vector<UObject*> states;
+        try
+        {
+            UObjectGlobals::FindAllOf(STR("PalPlayerState"), states);
+        }
+        catch (...)
+        {
+            return false;
+        }
+
+        for (UObject* state : states)
+        {
+            FGuid uid{};
+            if (ReadPlayerUId(state, uid) && uid == player_uid)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 }

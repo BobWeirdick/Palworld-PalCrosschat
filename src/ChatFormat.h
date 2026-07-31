@@ -20,9 +20,8 @@ namespace PalCrosschat
                                                         std::string_view player,
                                                         std::string_view message);
 
-    // Xbox / console path with a real SenderPlayerUId. Returns plain
-    // {player_name, message} — no ChatFormat tags (nil-uid tags get masked on Xbox).
-    // Renders as [PlayerName]:message.
+    // Xbox path with a real SenderPlayerUId. Plain native chat only:
+    // [PlayerName]: hello — no prefix/guild tags.
     std::pair<std::string, std::string> ApplyChatFormatAttributed(
         std::string_view format,
         std::string_view prefix,
