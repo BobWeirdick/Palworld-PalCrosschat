@@ -92,7 +92,6 @@ namespace PalCrosschat
 
             MYSQL_STMT* StmtInsert() const { return m_stmt_insert; }
             MYSQL_STMT* StmtSelect() const { return m_stmt_select; }
-            MYSQL_STMT* StmtCursorGet() const { return m_stmt_cursor_get; }
             MYSQL_STMT* StmtCursorUpsert() const { return m_stmt_cursor_upsert; }
             MYSQL_STMT* StmtMaxId() const { return m_stmt_max_id; }
             MYSQL_STMT* StmtLinkLookup() const { return m_stmt_link_lookup; }
@@ -105,16 +104,14 @@ namespace PalCrosschat
 
                 m_stmt_insert = mysql_stmt_init(m_mysql);
                 m_stmt_select = mysql_stmt_init(m_mysql);
-                m_stmt_cursor_get = mysql_stmt_init(m_mysql);
                 m_stmt_cursor_upsert = mysql_stmt_init(m_mysql);
                 m_stmt_max_id = mysql_stmt_init(m_mysql);
                 m_stmt_link_lookup = mysql_stmt_init(m_mysql);
                 m_stmt_link_conflict = mysql_stmt_init(m_mysql);
                 m_stmt_link_complete = mysql_stmt_init(m_mysql);
 
-                if (!m_stmt_insert || !m_stmt_select || !m_stmt_cursor_get || !m_stmt_cursor_upsert ||
-                    !m_stmt_max_id || !m_stmt_link_lookup || !m_stmt_link_conflict ||
-                    !m_stmt_link_complete)
+                if (!m_stmt_insert || !m_stmt_select || !m_stmt_cursor_upsert || !m_stmt_max_id ||
+                    !m_stmt_link_lookup || !m_stmt_link_conflict || !m_stmt_link_complete)
                 {
                     FreeStmts();
                     return false;
@@ -128,8 +125,6 @@ namespace PalCrosschat
                     "SELECT id, origin, sender_name, sender_id, guild_name, message "
                     "FROM crosschat_messages "
                     "WHERE id > ? AND origin != ? ORDER BY id ASC LIMIT ?";
-                const char* cursor_get_sql =
-                    "SELECT last_id FROM crosschat_cursors WHERE consumer = ? LIMIT 1";
                 const char* cursor_upsert_sql =
                     "INSERT INTO crosschat_cursors (consumer, last_id) VALUES (?, ?) "
                     "ON DUPLICATE KEY UPDATE last_id = VALUES(last_id)";
@@ -146,7 +141,6 @@ namespace PalCrosschat
 
                 if (mysql_stmt_prepare(m_stmt_insert, insert_sql, static_cast<unsigned long>(std::strlen(insert_sql))) != 0 ||
                     mysql_stmt_prepare(m_stmt_select, select_sql, static_cast<unsigned long>(std::strlen(select_sql))) != 0 ||
-                    mysql_stmt_prepare(m_stmt_cursor_get, cursor_get_sql, static_cast<unsigned long>(std::strlen(cursor_get_sql))) != 0 ||
                     mysql_stmt_prepare(m_stmt_cursor_upsert, cursor_upsert_sql, static_cast<unsigned long>(std::strlen(cursor_upsert_sql))) != 0 ||
                     mysql_stmt_prepare(m_stmt_max_id, max_id_sql, static_cast<unsigned long>(std::strlen(max_id_sql))) != 0 ||
                     mysql_stmt_prepare(m_stmt_link_lookup, link_lookup_sql, static_cast<unsigned long>(std::strlen(link_lookup_sql))) != 0 ||
@@ -169,7 +163,6 @@ namespace PalCrosschat
                 };
                 free_one(m_stmt_insert);
                 free_one(m_stmt_select);
-                free_one(m_stmt_cursor_get);
                 free_one(m_stmt_cursor_upsert);
                 free_one(m_stmt_max_id);
                 free_one(m_stmt_link_lookup);
@@ -181,7 +174,6 @@ namespace PalCrosschat
             MYSQL* m_mysql = nullptr;
             MYSQL_STMT* m_stmt_insert = nullptr;
             MYSQL_STMT* m_stmt_select = nullptr;
-            MYSQL_STMT* m_stmt_cursor_get = nullptr;
             MYSQL_STMT* m_stmt_cursor_upsert = nullptr;
             MYSQL_STMT* m_stmt_max_id = nullptr;
             MYSQL_STMT* m_stmt_link_lookup = nullptr;
@@ -353,59 +345,21 @@ namespace PalCrosschat
             conn.Close();
         };
 
+        // Live-only: on every connect/reconnect, jump to MAX(id). Never catch up
+        // messages that arrived while this process was down (restart backlog).
         auto init_cursor = [&]() -> bool {
-            MYSQL_STMT* stmt = conn.StmtCursorGet();
-            MYSQL_BIND bind_param{};
-            unsigned long consumer_len = 0;
-            BindString(bind_param, m_config.server_origin, consumer_len);
-
-            if (mysql_stmt_bind_param(stmt, &bind_param) != 0 || mysql_stmt_execute(stmt) != 0)
+            MYSQL_STMT* max_stmt = conn.StmtMaxId();
+            if (mysql_stmt_execute(max_stmt) != 0)
             {
-                if (conn.IsSchemaMissing() || IsSchemaError(mysql_stmt_errno(stmt)))
+                if (conn.IsSchemaMissing() || IsSchemaError(mysql_stmt_errno(max_stmt)))
                 {
                     log_schema_missing();
                 }
                 else
                 {
                     RC::Output::send<RC::LogLevel::Error>(
-                        STR("[PalCrosschat] Cursor SELECT failed: {}\n"),
-                        RC::ensure_str(mysql_stmt_error(stmt)));
-                }
-                return false;
-            }
-
-            int64_t last_id = 0;
-            MYSQL_BIND bind_result{};
-            BindI64(bind_result, last_id);
-            bool is_null = false;
-            bind_result.is_null = reinterpret_cast<char*>(&is_null);
-
-            if (mysql_stmt_bind_result(stmt, &bind_result) != 0)
-            {
-                return false;
-            }
-
-            const int fetch_rc = mysql_stmt_fetch(stmt);
-            mysql_stmt_free_result(stmt);
-
-            if (fetch_rc == 0)
-            {
-                m_cursor_id = last_id;
-                cursor_ready = true;
-                RC::Output::send<RC::LogLevel::Normal>(
-                    STR("[PalCrosschat] Cursor loaded: consumer={} last_id={}\n"),
-                    RC::ensure_str(m_config.server_origin),
-                    last_id);
-                return true;
-            }
-
-            // No cursor row: initialize to MAX(id) so we never replay history.
-            MYSQL_STMT* max_stmt = conn.StmtMaxId();
-            if (mysql_stmt_execute(max_stmt) != 0)
-            {
-                if (IsSchemaError(mysql_stmt_errno(max_stmt)))
-                {
-                    log_schema_missing();
+                        STR("[PalCrosschat] MAX(id) SELECT failed: {}\n"),
+                        RC::ensure_str(mysql_stmt_error(max_stmt)));
                 }
                 return false;
             }
@@ -427,16 +381,23 @@ namespace PalCrosschat
             BindI64(upsert_binds[1], max_id);
             if (mysql_stmt_bind_param(upsert, upsert_binds) != 0 || mysql_stmt_execute(upsert) != 0)
             {
-                RC::Output::send<RC::LogLevel::Error>(
-                    STR("[PalCrosschat] Cursor init INSERT failed: {}\n"),
-                    RC::ensure_str(mysql_stmt_error(upsert)));
+                if (IsSchemaError(mysql_stmt_errno(upsert)))
+                {
+                    log_schema_missing();
+                }
+                else
+                {
+                    RC::Output::send<RC::LogLevel::Error>(
+                        STR("[PalCrosschat] Cursor upsert failed: {}\n"),
+                        RC::ensure_str(mysql_stmt_error(upsert)));
+                }
                 return false;
             }
 
             m_cursor_id = max_id;
             cursor_ready = true;
             RC::Output::send<RC::LogLevel::Normal>(
-                STR("[PalCrosschat] Cursor initialized to MAX(id)={} (no history replay)\n"),
+                STR("[PalCrosschat] Cursor set to MAX(id)={} (live-only; no catch-up)\n"),
                 max_id);
             return true;
         };

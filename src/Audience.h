@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -12,29 +13,37 @@
 
 namespace PalCrosschat
 {
-    // Tracks PlayerUId -> platform (steam_/gdk_/ps5_) and splits online players into
-    // Xbox (gdk_) vs everyone else for dual chat broadcasts.
+    // Online audience for dual chat broadcasts.
+    //
+    // CRITICAL: FindAllOf must NOT run on every chat line — that pattern AVs inside
+    // UE4SS (same class as ServerEventsRelay crashes). Refresh runs on a slow timer
+    // from on_update; BroadcastDual only reads the snapshot. No UniqueNetId PE.
     class AudienceTracker
     {
     public:
-        // Cache a player's platform from chat / !setdiscord (game thread or any).
+        // Cache platform from chat / !setdiscord (any thread).
         void Remember(const RC::Unreal::FGuid& player_uid, const std::string& platform_user_id);
 
-        // Resolve unknown platforms via AccountName / SEH UniqueNetId (game thread,
-        // outside EnterChat_Receive). Cap work per call.
-        void WarmUnknownPlatforms(int max_resolves = 4);
+        // Game thread / on_update only. At most one FindAllOf per interval; AccountName only.
+        void TickRefresh();
 
-        // Scan online PalPlayerState objects (game thread only).
-        // xbox = gdk_ only; others = steam_/ps5_/unknown (formatted nil-UID path).
-        void Collect(std::vector<RC::Unreal::FGuid>& xbox,
-                     std::vector<RC::Unreal::FGuid>& others);
+        // Copy last snapshot (no FindAllOf). xbox = gdk_; others = everyone else online.
+        void Snapshot(std::vector<RC::Unreal::FGuid>& xbox,
+                      std::vector<RC::Unreal::FGuid>& others) const;
 
-        // True if this PlayerUId belongs to a currently online PalPlayerState.
+        // True if uid was in the last successful refresh (no FindAllOf).
         bool IsOnlinePlayerUid(const RC::Unreal::FGuid& player_uid) const;
 
     private:
-        std::mutex m_mutex;
+        void RefreshNow();
+
+        mutable std::mutex m_mutex;
         // FormatGuid(PlayerUId) -> steam_/gdk_/ps5_…
         std::unordered_map<std::string, std::string> m_platform_by_uid;
+        std::vector<RC::Unreal::FGuid> m_xbox;
+        std::vector<RC::Unreal::FGuid> m_others;
+        std::unordered_set<std::string> m_online_keys;
+        std::chrono::steady_clock::time_point m_last_refresh{};
+        bool m_have_snapshot = false;
     };
 }

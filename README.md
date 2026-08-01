@@ -126,7 +126,7 @@ Tables already exist (do not create them from this mod):
 - `crosschat_cursors(consumer, last_id)`
 - `crosschat_players(DiscordId, Platform, UserId, PlatformUserId, PlayerName, LinkedAt, ConnectCode)` — Discord linking
 
-This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ?`. Consumer name equals `ServerOrigin`. On first install with no cursor row, the cursor is set to `MAX(id)` so history is never replayed.
+This mod INSERTs with `origin = ServerOrigin` (including the player's Palworld guild name) and SELECTs `WHERE id > ? AND origin != ?`. Consumer name equals `ServerOrigin`. On every connect/reconnect the cursor is set to `MAX(id)` so only new live messages are injected (no restart catch-up).
 
 ### Chat channels
 
@@ -144,7 +144,7 @@ servers and Discord, so global is the only channel ever written there.
 With `DebugVerbose`, each chat line logs `CHAT pal_cat=… relayed=…`, which is the
 quickest way to confirm what channel the server actually saw for a given message.
 
-### Xbox / console dual broadcast (v1.79+, v1.83)
+### Xbox / console dual broadcast (v1.79+, v1.86)
 
 Custom `ChatFormat` Sender tags require a nil `SenderPlayerUId`; Xbox clients mask
 chat bodies they cannot attribute. Injected/rebroadcast lines split via
@@ -152,11 +152,16 @@ chat bodies they cannot attribute. Injected/rebroadcast lines split via
 
 - **steam_ / ps5_ / unknown** — formatted Sender tags (`[EU][WOWZERS][Name]: hello`, nil uid).
 - **gdk_ only** — plain native chat (`[Name]: hello`) with a **local** sender
-  `PlayerUId` (no `[NA]` / guild tags). Platforms are warmed via SEH UniqueNetId
-  when `AccountName` is empty.
+  `PlayerUId` (no `[NA]` / guild tags).
 
-Use a complete ChatFormat (note the `]` after `{player}`):
-`"[{prefix}][{guild}][{player}]: {message}"`.
+Audience splits are **cached** (~3s refresh from `on_update`: one `FindAllOf`,
+`AccountName` / chat-hook `Remember` only — no UniqueNetId ProcessEvent). Chat inject
+never scans players (v1.85). Inject waits for World+GameState plus a short warm-up
+and drains restart backlog slowly (v1.86). Broadcast param FStrings are filled with
+in-place `AppendChars` (never `*fs = FString(...)`), matching the EnterChat heap-fix.
+
+`ChatFormat` may omit a trailing `]` after `{player}` if you rely on Palworld’s
+native closer (e.g. `[{prefix}][{guild}][{player}: {message}`).
 
 Remote/cross-server UIDs are never set as `SenderPlayerUId` (avoids `------`).
 Discord → game rows have no Palworld `PlayerUId`, so Xbox may still mask those.
@@ -266,5 +271,5 @@ Rebuild this mod against the same UE4SS binary you ship on the server (CRT/ABI m
 - [ ] Chat typed in game appears as a DB row within ~1s
 - [ ] Row with a different origin appears in game within two poll intervals
 - [ ] Injected messages are not re-captured into the DB
-- [ ] Server restart does not replay old messages (cursor persists)
+- [ ] Server restart does not replay old messages (cursor jumps to MAX(id) on connect)
 - [ ] Exceptions in hooks/tick are logged and never crash the process

@@ -126,9 +126,70 @@ namespace PalCrosschat
 
         constexpr size_t kMaxDeferredActions = 64;
 
+        // Warm up after GameState+World appear before any BroadcastChatMessage.
+        // Post-restart inbound backlog was firing dozens of ProcessEvents in <1s.
+        constexpr auto kInjectWarmup = std::chrono::seconds(15);
+        constexpr auto kInjectRamp = std::chrono::seconds(60);
+
         StringType Utf8ToUe(const std::string& utf8)
         {
             return RC::ensure_str(utf8);
+        }
+
+        // Fill an InitializeStruct'd (or InitializeValue'd) FString without
+        // `*fs = FString(temp)`. Assignment Emptys the game-initialized buffer and
+        // reallocates — the same heap mismatch that caused delayed PalServer+0x326e*
+        // crashes when clearing EnterChat messages. Append into the existing empty
+        // string instead (grows via FMemory / GMalloc only).
+        void FillInitFString(FString* dest, const std::string& utf8)
+        {
+            if (!dest)
+            {
+                return;
+            }
+
+            const StringType text = Utf8ToUe(utf8);
+
+            struct RawFString
+            {
+                TCHAR* data;
+                int32 num;
+                int32 max;
+            };
+            static_assert(sizeof(RawFString) == 16, "FString layout assumption");
+            auto* raw = reinterpret_cast<RawFString*>(dest);
+
+            // Reject garbage; leave untouched so DestroyStruct can still run.
+            if (raw->num < 0 || raw->max < 0 || raw->num > raw->max || raw->max > 0x100000)
+            {
+                return;
+            }
+
+            // Empty-with-terminator (Num==1) or truly empty: AppendChars is safe.
+            // Non-empty content should not appear on a fresh InitializeStruct; if it
+            // does, truncate in place (no free) then append.
+            if (raw->num > 1 && raw->data)
+            {
+                raw->data[0] = static_cast<TCHAR>(0);
+                raw->num = 1;
+            }
+
+            if (!text.empty())
+            {
+                dest->AppendChars(text.c_str(), static_cast<int32>(text.length()));
+            }
+        }
+
+        bool HasWorldObject()
+        {
+            try
+            {
+                return UObjectGlobals::FindFirstOf(STR("World")) != nullptr;
+            }
+            catch (...)
+            {
+                return false;
+            }
         }
     }
 
@@ -264,7 +325,7 @@ namespace PalCrosschat
 
         {
             FString* sender_fs = std::bit_cast<FString*>(chat + m_off_sender);
-            *sender_fs = FString(Utf8ToUe(display_sender));
+            FillInitFString(sender_fs, display_sender);
         }
 
         {
@@ -278,7 +339,7 @@ namespace PalCrosschat
 
         {
             FString* message_fs = std::bit_cast<FString*>(chat + m_off_message);
-            *message_fs = FString(Utf8ToUe(message));
+            FillInitFString(message_fs, message);
         }
 
         if (receivers && !receivers->empty())
@@ -474,13 +535,12 @@ namespace PalCrosschat
                                    uint8_t category,
                                    const FGuid* sender_player_uid)
     {
+        // Cache-only — FindAllOf / UniqueNetId run on AudienceTracker::TickRefresh (on_update).
         std::vector<FGuid> xbox;
         std::vector<FGuid> others;
         if (m_audience)
         {
-            // Fill steam_/gdk_ cache for players with empty AccountName (SEH UniqueNetId).
-            m_audience->WarmUnknownPlatforms(4);
-            m_audience->Collect(xbox, others);
+            m_audience->Snapshot(xbox, others);
         }
 
         // Remote / non-local PlayerUIds render as "------" — only attribute local senders.
@@ -575,7 +635,7 @@ namespace PalCrosschat
         {
             if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.data()))
             {
-                *msg = FString(Utf8ToUe(clean));
+                FillInitFString(msg, clean);
             }
         }
 
@@ -634,7 +694,7 @@ namespace PalCrosschat
         {
             if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.data()))
             {
-                *msg = FString(Utf8ToUe(clean));
+                FillInitFString(msg, clean);
             }
         }
         if (FProperty* dur_prop = fn->FindProperty(FName(STR("Duration"), FNAME_Find)))
@@ -721,14 +781,65 @@ namespace PalCrosschat
                              have_sender_uid ? &sender_uid : nullptr);
     }
 
+    bool ChatInject::CanInjectNow(int& out_max_this_tick, int configured_max)
+    {
+        out_max_this_tick = 0;
+        if (!HasWorldObject() || !ResolveGameState())
+        {
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (m_world_ready_at.time_since_epoch().count() == 0)
+        {
+            m_world_ready_at = now;
+            if (!m_world_ready_logged)
+            {
+                m_world_ready_logged = true;
+                Output::send<LogLevel::Normal>(
+                    STR("[PalCrosschat] World ready; inject warm-up {}s\n"),
+                    static_cast<int>(kInjectWarmup.count()));
+            }
+        }
+
+        if (now - m_world_ready_at < kInjectWarmup)
+        {
+            return false;
+        }
+
+        if (!m_inject_enabled_logged)
+        {
+            m_inject_enabled_logged = true;
+            Output::send<LogLevel::Normal>(
+                STR("[PalCrosschat] Inject enabled (warm-up complete)\n"));
+        }
+
+        const int cap = configured_max > 0 ? configured_max : 1;
+        if (now - m_world_ready_at < kInjectRamp)
+        {
+            out_max_this_tick = 1; // drain backlog slowly after restart
+        }
+        else
+        {
+            out_max_this_tick = cap;
+        }
+        return true;
+    }
+
     void ChatInject::Drain(InboundQueue& inbound, int max_per_tick)
     {
         try
         {
-            // Finish hook-queued ProcessEvent work before inbound injects.
-            FlushDeferred(max_per_tick > 0 ? max_per_tick : 8);
+            int limit = 0;
+            if (!CanInjectNow(limit, max_per_tick))
+            {
+                return;
+            }
 
-            for (int i = 0; i < max_per_tick; ++i)
+            // Finish hook-queued ProcessEvent work before inbound injects.
+            FlushDeferred(limit > 0 ? limit : 1);
+
+            for (int i = 0; i < limit; ++i)
             {
                 // THREAD BOUNDARY: inbound queue -> game thread (plain structs only). No MySQL here.
                 auto item = inbound.TryPop();

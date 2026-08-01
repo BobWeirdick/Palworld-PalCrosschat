@@ -4,6 +4,7 @@
 #include "Config.h"
 #include "Queues.h"
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <mutex>
@@ -78,6 +79,8 @@ namespace PalCrosschat
         RC::Unreal::UObject* ResolveGameState();
         bool EnsureBroadcastFunction();
         bool EnsureServerNoticeFunction();
+        // World + GameState present, and warmup elapsed (avoids startup ProcessEvent storms).
+        bool CanInjectNow(int& out_max_this_tick, int configured_max);
         void FlushDeferred(int max_actions);
         bool BroadcastOne(const InboundMessage& msg);
         bool BroadcastDisplay(const std::string& display_sender,
@@ -112,6 +115,11 @@ namespace PalCrosschat
 
         std::mutex m_deferred_mutex;
         std::deque<DeferredAction> m_deferred;
+
+        // Set on first World+GameState sighting; inject blocked until warmup elapses.
+        std::chrono::steady_clock::time_point m_world_ready_at{};
+        bool m_world_ready_logged = false;
+        bool m_inject_enabled_logged = false;
 
         // Reflected offsets inside the ChatMessage struct parameter (relative to struct start).
         bool m_offsets_ready = false;
