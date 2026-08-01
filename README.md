@@ -107,12 +107,13 @@ If `config.json` is missing, MySQL fields are empty, or `ServerOrigin` is invali
 
 ### ChatFilter
 
-On a local hit the message is cleared in `EnterChat_Receive` (never broadcasts or relays). The player is muted for that pattern’s `MuteMinutes` (`0` = block only). A red **Notifications from the server** banner is shown via `BroadcastServerNotice`:
+On a local hit the message is cleared in `EnterChat_Receive` (never broadcasts or relays). The player is muted for that pattern’s `MuteMinutes` (`0` = block only). Feedback is **private to that player only** (v1.89+):
 
 - Initial: `{InitialMuteNotification}` plus the pattern’s `MuteMessage` on the next line  
 - Active (chat while muted): `{ActiveMuteNotification}` only (throttled every 15s)
 
-The client hardcodes the header text “Notifications from the server”; only the notice body is controllable. `BroadcastServerNotice` is NetMulticast (all clients can see the banner). A private `SendScreenLogToClient` line is also sent to the muted player.
+Delivery: private chat (`ReceiverPlayerUIds`) plus `SendScreenLogToClient`.  
+`BroadcastServerNotice` is not used for mutes (it is NetMulticast and was visible to everyone).
 
 Legacy `WordBlacklist` / `BlockedWords` configs still load if `ChatFilter` is absent.
 
@@ -154,11 +155,12 @@ chat bodies they cannot attribute. Injected/rebroadcast lines split via
 - **gdk_ only** — plain native chat (`[Name]: hello`) with a **local** sender
   `PlayerUId` (no `[NA]` / guild tags).
 
-Audience splits are **cached** (~3s refresh from `on_update`: one `FindAllOf`,
-`AccountName` / chat-hook `Remember` only — no UniqueNetId ProcessEvent). Chat inject
-never scans players (v1.85). Inject waits for World+GameState plus a short warm-up
-and drains restart backlog slowly (v1.86). Broadcast param FStrings are filled with
-in-place `AppendChars` (never `*fs = FString(...)`), matching the EnterChat heap-fix.
+Audience splits are optional (`EnableAudienceScan`, default **false** in v1.88 — the
+EU crash log never showed `xbox>0` but still ran `FindAllOf` every few seconds).
+When enabled: ~3s refresh, `AccountName` / chat-hook `Remember` only. Inject is
+live-only (cursor → `MAX(id)` on connect), warm-up gated, and fills broadcast
+FStrings via game `GMalloc` (no UE4SS `FString` assign/Append; no `DestroyStruct`
+after a successful `ProcessEvent`).
 
 `ChatFormat` may omit a trailing `]` after `{player}` if you rely on Palworld’s
 native closer (e.g. `[{prefix}][{guild}][{player}: {message}`).

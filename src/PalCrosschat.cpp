@@ -21,7 +21,7 @@ public:
     PalCrosschatMod() : CppUserModBase()
     {
         ModName = STR("PalCrosschat");
-        ModVersion = STR("1.87");
+        ModVersion = STR("1.89");
         ModDescription = STR("Relays Palworld chat to MySQL, injects cross-server messages, Discord !setdiscord link");
         ModAuthors = STR("ARKADE");
 
@@ -113,8 +113,8 @@ public:
             m_capture->FlushDeferred();
         }
 
-        // Slow audience refresh (FindAllOf + AccountName props only). Never per chat line.
-        if (m_audience)
+        // Optional audience refresh for Xbox dual split (FindAllOf). Off by default (v1.88).
+        if (m_audience && m_config.enable_audience_scan)
         {
             m_audience->TickRefresh();
         }

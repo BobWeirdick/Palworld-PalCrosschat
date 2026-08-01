@@ -912,8 +912,13 @@ namespace PalCrosschat
             {
                 return;
             }
-            // Defer ProcessEvent until on_update — nested PE inside EnterChat_Receive is unsafe.
-            m_inject->EnqueueServerNotice(banner);
+            // Private only. BroadcastServerNotice is NetMulticast — everyone saw mute
+            // banners. Prefer private chat (ReceiverPlayerUIds) + screen log on this
+            // controller; both are deferred to on_update (no nested PE here).
+            if (!(sender_uid == FGuid{}))
+            {
+                m_inject->EnqueuePrivateChat(sender_uid, banner);
+            }
             m_inject->EnqueueScreenLog(controller, banner);
         };
 

@@ -49,6 +49,10 @@ namespace PalCrosschat
         // separately: PC gets nil-uid ChatFormat; gdk_ clients get plain chat with a
         // real SenderPlayerUId. Kept for config compatibility; unused by the dual path.
         bool preserve_sender_uid = false;
+        // When true, on_update runs FindAllOf(PalPlayerState) for Xbox dual split.
+        // Default false: EU crash log never saw xbox>0 but still FindAllOf'd every few
+        // seconds — disable scan unless Xbox dual is needed.
+        bool enable_audience_scan = false;
 
         // ChatFilter
         std::string mute_log_webhook;

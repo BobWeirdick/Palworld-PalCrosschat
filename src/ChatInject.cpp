@@ -12,6 +12,11 @@
 #include <string_view>
 #include <vector>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+
 #include <DynamicOutput/DynamicOutput.hpp>
 #include <Helpers/String.hpp>
 #include <Unreal/FString.hpp>
@@ -103,7 +108,10 @@ namespace PalCrosschat
 
             ~ParamBufferGuard()
             {
-                if (m_initialized && m_chat_struct && m_data)
+                // v1.88: after a successful ProcessEvent we skip DestroyStruct.
+                // Destroying FStrings/TArrays filled via mod code has correlated with
+                // delayed PalServer FString heap fatals (log ends mid-BroadcastDual).
+                if (m_initialized && m_chat_struct && m_data && !m_leak_after_pe)
                 {
                     m_chat_struct->DestroyStruct(m_data.get() + m_chat_offset);
                 }
@@ -111,6 +119,8 @@ namespace PalCrosschat
 
             ParamBufferGuard(const ParamBufferGuard&) = delete;
             ParamBufferGuard& operator=(const ParamBufferGuard&) = delete;
+
+            void LeakAfterProcessEvent() { m_leak_after_pe = true; }
 
             uint8* Data() { return m_data.get(); }
             uint8* ChatMessage() { return m_data.get() + m_chat_offset; }
@@ -122,25 +132,47 @@ namespace PalCrosschat
             size_t m_size = 0;
             std::unique_ptr<uint8[]> m_data;
             bool m_initialized = false;
+            bool m_leak_after_pe = false;
         };
 
         constexpr size_t kMaxDeferredActions = 64;
 
         // Warm up after GameState+World appear before any BroadcastChatMessage.
-        // Post-restart inbound backlog was firing dozens of ProcessEvents in <1s.
         constexpr auto kInjectWarmup = std::chrono::seconds(15);
         constexpr auto kInjectRamp = std::chrono::seconds(60);
+
+        struct RawFString
+        {
+            TCHAR* data;
+            int32 num;
+            int32 max;
+        };
+        static_assert(sizeof(RawFString) == 16, "FString layout assumption");
 
         StringType Utf8ToUe(const std::string& utf8)
         {
             return RC::ensure_str(utf8);
         }
 
-        // Fill an InitializeStruct'd (or InitializeValue'd) FString without
-        // `*fs = FString(temp)`. Assignment Emptys the game-initialized buffer and
-        // reallocates — the same heap mismatch that caused delayed PalServer+0x326e*
-        // crashes when clearing EnterChat messages. Append into the existing empty
-        // string instead (grows via FMemory / GMalloc only).
+        void GameFree(void* ptr)
+        {
+            if (ptr && GMalloc && *GMalloc)
+            {
+                (*GMalloc)->Free(ptr);
+            }
+        }
+
+        void* GameMalloc(size_t bytes)
+        {
+            if (!GMalloc || !*GMalloc || bytes == 0)
+            {
+                return nullptr;
+            }
+            return (*GMalloc)->Malloc(bytes, DEFAULT_ALIGNMENT);
+        }
+
+        // Fill InitializeStruct'd FString using the game allocator only.
+        // Never FString::operator= / AppendChars / Empty (UE4SS TArray paths).
         void FillInitFString(FString* dest, const std::string& utf8)
         {
             if (!dest)
@@ -148,36 +180,75 @@ namespace PalCrosschat
                 return;
             }
 
-            const StringType text = Utf8ToUe(utf8);
-
-            struct RawFString
-            {
-                TCHAR* data;
-                int32 num;
-                int32 max;
-            };
-            static_assert(sizeof(RawFString) == 16, "FString layout assumption");
             auto* raw = reinterpret_cast<RawFString*>(dest);
-
-            // Reject garbage; leave untouched so DestroyStruct can still run.
             if (raw->num < 0 || raw->max < 0 || raw->num > raw->max || raw->max > 0x100000)
             {
                 return;
             }
 
-            // Empty-with-terminator (Num==1) or truly empty: AppendChars is safe.
-            // Non-empty content should not appear on a fresh InitializeStruct; if it
-            // does, truncate in place (no free) then append.
-            if (raw->num > 1 && raw->data)
+            // Drop any InitializeStruct buffer without UE4SS Empty().
+            if (raw->data)
             {
-                raw->data[0] = static_cast<TCHAR>(0);
-                raw->num = 1;
+                GameFree(raw->data);
+            }
+            raw->data = nullptr;
+            raw->num = 0;
+            raw->max = 0;
+
+            const StringType text = Utf8ToUe(utf8);
+            if (text.empty())
+            {
+                return;
             }
 
-            if (!text.empty())
+            const int32 len = static_cast<int32>(text.length());
+            const int32 max = len + 1;
+            auto* buf = static_cast<TCHAR*>(GameMalloc(static_cast<size_t>(max) * sizeof(TCHAR)));
+            if (!buf)
             {
-                dest->AppendChars(text.c_str(), static_cast<int32>(text.length()));
+                return;
             }
+            std::memcpy(buf, text.c_str(), static_cast<size_t>(len) * sizeof(TCHAR));
+            buf[len] = static_cast<TCHAR>(0);
+            raw->data = buf;
+            raw->num = max; // includes null terminator (UE FString convention)
+            raw->max = max;
+        }
+
+        struct PeCtx
+        {
+            UObject* obj = nullptr;
+            UFunction* fn = nullptr;
+            void* params = nullptr;
+        };
+
+        int ProcessEventSeh(PeCtx* ctx)
+        {
+            __try
+            {
+                ctx->obj->ProcessEvent(ctx->fn, ctx->params);
+                return 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                return 1;
+            }
+        }
+
+        bool SafeProcessEvent(UObject* obj, UFunction* fn, void* params)
+        {
+            if (!obj || !fn || !params)
+            {
+                return false;
+            }
+            PeCtx ctx{obj, fn, params};
+            if (ProcessEventSeh(&ctx) != 0)
+            {
+                Output::send<LogLevel::Error>(
+                    STR("[PalCrosschat] ProcessEvent faulted (BroadcastChatMessage); skipped destroy\n"));
+                return false;
+            }
+            return true;
         }
 
         bool HasWorldObject()
@@ -360,7 +431,17 @@ namespace PalCrosschat
         {
             return false;
         }
-        game_state->ProcessEvent(m_broadcast_fn, guard.Data());
+
+        if (!SafeProcessEvent(game_state, m_broadcast_fn, guard.Data()))
+        {
+            // Fault during PE: do not DestroyStruct (may already be half-consumed).
+            guard.LeakAfterProcessEvent();
+            return false;
+        }
+
+        // Success: skip DestroyStruct — game copied what it needed; tearing down
+        // mod-filled FStrings here has been tied to delayed dedicated-server fatals.
+        guard.LeakAfterProcessEvent();
         return true;
     }
 

@@ -182,6 +182,8 @@ namespace PalCrosschat
             GetOr<bool>(format, "ShowLocalServerTag", cfg.show_local_server_tag);
         cfg.preserve_sender_uid =
             GetOr<bool>(format, "PreserveSenderUId", cfg.preserve_sender_uid);
+        cfg.enable_audience_scan =
+            GetOr<bool>(format, "EnableAudienceScan", cfg.enable_audience_scan);
 
         cfg.mute_log_webhook = GetOr<std::string>(
             chat_filter,
@@ -286,7 +288,7 @@ namespace PalCrosschat
         RC::Output::send<RC::LogLevel::Normal>(
             STR("[PalCrosschat] Config: origin={} poll={}ms maxBatch={} maxBroadcasts/tick={} verbose={} "
                 "mysql={}:{} user={} db={} backoffMax={}s injectCategory={} showLocalTag={} "
-                "prefixes=[{}|{}|{}] chatFormat={} chatFilterPatterns={} muteWebhook={}\n"),
+                "audienceScan={} prefixes=[{}|{}|{}] chatFormat={} chatFilterPatterns={} muteWebhook={}\n"),
             RC::ensure_str(cfg.server_origin),
             cfg.poll_interval_ms,
             cfg.max_batch,
@@ -299,6 +301,7 @@ namespace PalCrosschat
             cfg.reconnect_backoff_max_sec,
             RC::ensure_str(cfg.inject_category_name),
             cfg.show_local_server_tag ? STR("true") : STR("false"),
+            cfg.enable_audience_scan ? STR("true") : STR("false"),
             RC::ensure_str(cfg.prefix_na),
             RC::ensure_str(cfg.prefix_eu),
             RC::ensure_str(cfg.prefix_discord),
