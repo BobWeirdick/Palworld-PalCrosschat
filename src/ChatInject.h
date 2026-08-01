@@ -121,6 +121,11 @@ namespace PalCrosschat
         bool m_world_ready_logged = false;
         bool m_inject_enabled_logged = false;
 
+        // After BroadcastChatMessage ProcessEvent AVs, stop all inject for this process
+        // (retry storms were killing the dedicated server after the first fault).
+        bool m_inject_circuit_open = false;
+        void TripInjectCircuit(const TCHAR* reason);
+
         // Reflected offsets inside the ChatMessage struct parameter (relative to struct start).
         bool m_offsets_ready = false;
         int32_t m_chat_param_offset = 0;

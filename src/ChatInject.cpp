@@ -92,47 +92,27 @@ namespace PalCrosschat
         class ParamBufferGuard
         {
         public:
+            // Zero-fill only — no InitializeStruct/DestroyStruct. Those paths allocate
+            // empty FStrings the game may share; freeing/destroying them from the mod
+            // has correlated with delayed BroadcastChatMessage AVs.
             ParamBufferGuard(UFunction* fn, const UStruct* chat_struct, int32_t chat_offset)
-                : m_fn(fn), m_chat_struct(chat_struct), m_chat_offset(chat_offset)
+                : m_chat_offset(chat_offset)
             {
                 const auto size = fn->GetParmsSize();
-                m_size = size;
                 m_data = std::make_unique<uint8[]>(size);
                 std::memset(m_data.get(), 0, size);
-                if (m_chat_struct)
-                {
-                    m_chat_struct->InitializeStruct(m_data.get() + m_chat_offset);
-                    m_initialized = true;
-                }
-            }
-
-            ~ParamBufferGuard()
-            {
-                // v1.88: after a successful ProcessEvent we skip DestroyStruct.
-                // Destroying FStrings/TArrays filled via mod code has correlated with
-                // delayed PalServer FString heap fatals (log ends mid-BroadcastDual).
-                if (m_initialized && m_chat_struct && m_data && !m_leak_after_pe)
-                {
-                    m_chat_struct->DestroyStruct(m_data.get() + m_chat_offset);
-                }
+                (void)chat_struct;
             }
 
             ParamBufferGuard(const ParamBufferGuard&) = delete;
             ParamBufferGuard& operator=(const ParamBufferGuard&) = delete;
 
-            void LeakAfterProcessEvent() { m_leak_after_pe = true; }
-
             uint8* Data() { return m_data.get(); }
             uint8* ChatMessage() { return m_data.get() + m_chat_offset; }
 
         private:
-            UFunction* m_fn = nullptr;
-            const UStruct* m_chat_struct = nullptr;
             int32_t m_chat_offset = 0;
-            size_t m_size = 0;
             std::unique_ptr<uint8[]> m_data;
-            bool m_initialized = false;
-            bool m_leak_after_pe = false;
         };
 
         constexpr size_t kMaxDeferredActions = 64;
@@ -171,8 +151,10 @@ namespace PalCrosschat
             return (*GMalloc)->Malloc(bytes, DEFAULT_ALIGNMENT);
         }
 
-        // Fill InitializeStruct'd FString using the game allocator only.
+        // Fill a zeroed / empty FString using the game allocator only.
         // Never FString::operator= / AppendChars / Empty (UE4SS TArray paths).
+        // Never Free buffers with Num<=1 — InitializeStruct empty strings may share
+        // a global empty pointer; freeing that corrupts the game heap.
         void FillInitFString(FString* dest, const std::string& utf8)
         {
             if (!dest)
@@ -186,33 +168,34 @@ namespace PalCrosschat
                 return;
             }
 
-            // Drop any InitializeStruct buffer without UE4SS Empty().
-            if (raw->data)
-            {
-                GameFree(raw->data);
-            }
+            TCHAR* old = raw->data;
+            const int32 old_num = raw->num;
             raw->data = nullptr;
             raw->num = 0;
             raw->max = 0;
 
             const StringType text = Utf8ToUe(utf8);
-            if (text.empty())
+            if (!text.empty())
             {
-                return;
+                const int32 len = static_cast<int32>(text.length());
+                const int32 max = len + 1;
+                auto* buf =
+                    static_cast<TCHAR*>(GameMalloc(static_cast<size_t>(max) * sizeof(TCHAR)));
+                if (buf)
+                {
+                    std::memcpy(buf, text.c_str(), static_cast<size_t>(len) * sizeof(TCHAR));
+                    buf[len] = static_cast<TCHAR>(0);
+                    raw->data = buf;
+                    raw->num = max; // includes null terminator (UE FString convention)
+                    raw->max = max;
+                }
             }
 
-            const int32 len = static_cast<int32>(text.length());
-            const int32 max = len + 1;
-            auto* buf = static_cast<TCHAR*>(GameMalloc(static_cast<size_t>(max) * sizeof(TCHAR)));
-            if (!buf)
+            // Only free a buffer that looks like real owned content (not empty/shared).
+            if (old && old_num > 1)
             {
-                return;
+                GameFree(old);
             }
-            std::memcpy(buf, text.c_str(), static_cast<size_t>(len) * sizeof(TCHAR));
-            buf[len] = static_cast<TCHAR>(0);
-            raw->data = buf;
-            raw->num = max; // includes null terminator (UE FString convention)
-            raw->max = max;
         }
 
         struct PeCtx
@@ -377,12 +360,31 @@ namespace PalCrosschat
         return true;
     }
 
+    void ChatInject::TripInjectCircuit(const TCHAR* reason)
+    {
+        if (m_inject_circuit_open)
+        {
+            return;
+        }
+        m_inject_circuit_open = true;
+        m_game_state.Reset();
+        Output::send<LogLevel::Error>(
+            STR("[PalCrosschat] INJECT CIRCUIT OPEN — {} — chat inject disabled for this "
+                "process (capture/relay to DB still runs). Restart to re-enable.\n"),
+            reason ? reason : STR("unknown"));
+    }
+
     bool ChatInject::BroadcastDisplay(const std::string& display_sender,
                                       const std::string& message,
                                       uint8_t category,
                                       const std::vector<FGuid>* receivers,
                                       const FGuid* sender_player_uid)
     {
+        if (m_inject_circuit_open)
+        {
+            return true; // drop; do not retry
+        }
+
         UObject* game_state = ResolveGameState();
         if (!game_state || !EnsureBroadcastFunction())
         {
@@ -415,15 +417,33 @@ namespace PalCrosschat
 
         if (receivers && !receivers->empty())
         {
-            auto* receiver_array = std::bit_cast<TArray<FGuid>*>(chat + m_off_receivers);
-            for (const FGuid& uid : *receivers)
+            // Zeroed TArray — set via raw layout so we never use UE4SS TArray::Add.
+            struct RawTArray
             {
-                receiver_array->Add(uid);
+                FGuid* data;
+                int32 num;
+                int32 max;
+            };
+            auto* arr = reinterpret_cast<RawTArray*>(chat + m_off_receivers);
+            const int32 n = static_cast<int32>(receivers->size());
+            if (n > 0 && n < 512)
+            {
+                auto* buf = static_cast<FGuid*>(
+                    GameMalloc(static_cast<size_t>(n) * sizeof(FGuid)));
+                if (buf)
+                {
+                    for (int32 i = 0; i < n; ++i)
+                    {
+                        buf[i] = (*receivers)[static_cast<size_t>(i)];
+                    }
+                    arr->data = buf;
+                    arr->num = n;
+                    arr->max = n;
+                }
             }
         }
 
-        // MessageArgKeys / MessageArgValues: leave empty (InitializeStruct).
-        // MessageId: leave NAME_None (zeroed / default).
+        // MessageArgKeys / MessageArgValues / MessageId: left zeroed (empty / NAME_None).
 
         // Re-resolve immediately before ProcessEvent in case GC ran while building params.
         game_state = ResolveGameState();
@@ -434,14 +454,11 @@ namespace PalCrosschat
 
         if (!SafeProcessEvent(game_state, m_broadcast_fn, guard.Data()))
         {
-            // Fault during PE: do not DestroyStruct (may already be half-consumed).
-            guard.LeakAfterProcessEvent();
-            return false;
+            TripInjectCircuit(STR("BroadcastChatMessage ProcessEvent faulted"));
+            return true; // consume; circuit prevents retry storm
         }
 
-        // Success: skip DestroyStruct — game copied what it needed; tearing down
-        // mod-filled FStrings here has been tied to delayed dedicated-server fatals.
-        guard.LeakAfterProcessEvent();
+        // Intentionally leak param FString/TArray buffers (game copied what it needed).
         return true;
     }
 
@@ -865,6 +882,10 @@ namespace PalCrosschat
     bool ChatInject::CanInjectNow(int& out_max_this_tick, int configured_max)
     {
         out_max_this_tick = 0;
+        if (m_inject_circuit_open)
+        {
+            return false;
+        }
         if (!HasWorldObject() || !ResolveGameState())
         {
             return false;
