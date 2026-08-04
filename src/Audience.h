@@ -1,49 +1,100 @@
 #pragma once
 
-#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
+#include <utility>
 #include <vector>
 
-// Platform.hpp defines uint8 before UnrealCoreStructs uses it.
 #include <Unreal/Core/HAL/Platform.hpp>
+#include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/UnrealCoreStructs.hpp>
+#include <Unreal/UFunctionStructs.hpp>
+
+namespace RC::Unreal
+{
+    class UObject;
+}
 
 namespace PalCrosschat
 {
-    // Online audience for dual chat broadcasts.
+    // Online audience for dual chat broadcasts (Steam/PS5 formatted, Xbox plain).
     //
-    // CRITICAL: FindAllOf must NOT run on every chat line — that pattern AVs inside
-    // UE4SS (same class as ServerEventsRelay crashes). Refresh runs on a slow timer
-    // from on_update; BroadcastDual only reads the snapshot. No UniqueNetId PE.
+    // Roster is event-driven (no periodic FindAllOf):
+    //   - Bootstrap: one-shot SEH FindAllOf at first inject (players already online)
+    //   - Join: PalPlayerState:RequestJoinPlayer_ToServer hook
+    //   - Leave: FWeakObjectPtr on PlayerState goes invalid (swept on tick)
+    //   - Chat: Upsert if missing / refresh platform
+    //   - Inject fail targeting receivers: Forget those uids
+    // All failure paths log and continue; never crash the server.
     class AudienceTracker
     {
     public:
-        // Cache platform from chat / !setdiscord (any thread).
+        AudienceTracker() = default;
+        ~AudienceTracker();
+
+        AudienceTracker(const AudienceTracker&) = delete;
+        AudienceTracker& operator=(const AudienceTracker&) = delete;
+
+        void Register();
+        void Unregister();
+
+        // Game thread / on_update: pending joins + prune dead weak refs.
+        void Tick();
+
+        // One-shot SEH FindAllOf to seed players already online at restart.
+        // Never runs again (join hook + chat Upsert cover the rest). Safe if it faults.
+        void TryBootstrapOnce();
+
+        // Chat / join / !setdiscord: add or refresh (creates if missing).
+        void Upsert(const RC::Unreal::FGuid& player_uid,
+                    const std::string& platform_user_id,
+                    RC::Unreal::UObject* player_state = nullptr);
+
         void Remember(const RC::Unreal::FGuid& player_uid, const std::string& platform_user_id);
 
-        // Game thread / on_update only. At most one FindAllOf per interval; AccountName only.
-        void TickRefresh();
+        void Forget(const RC::Unreal::FGuid& player_uid);
+        void ForgetMany(const std::vector<RC::Unreal::FGuid>& player_uids);
 
-        // Copy last snapshot (no FindAllOf). xbox = gdk_; others = everyone else online.
         void Snapshot(std::vector<RC::Unreal::FGuid>& xbox,
-                      std::vector<RC::Unreal::FGuid>& others) const;
+                      std::vector<RC::Unreal::FGuid>& others);
 
-        // True if uid was in the last successful refresh (no FindAllOf).
         bool IsOnlinePlayerUid(const RC::Unreal::FGuid& player_uid) const;
+        size_t Size() const;
 
     private:
-        void RefreshNow();
+        struct RosterEntry
+        {
+            RC::Unreal::FGuid uid{};
+            std::string platform; // steam_ / gdk_ / ps5_ (may be empty until known)
+            RC::Unreal::FWeakObjectPtr player_state{};
+            bool has_weak = false; // true only after assigning a live PlayerState
+        };
+
+        struct PendingJoin
+        {
+            RC::Unreal::FWeakObjectPtr player_state{};
+            int frames = 0;
+        };
+
+        static void OnRequestJoinPlayer(RC::Unreal::UnrealScriptFunctionCallableContext& context,
+                                        void* custom_data);
+
+        void EnqueueJoin(RC::Unreal::UObject* player_state);
+        void ProcessPendingJoins();
+        void RebuildListsUnlocked();
+        bool TryReadJoinIdentity(RC::Unreal::UObject* player_state,
+                                 RC::Unreal::FGuid& out_uid,
+                                 std::string& out_platform) const;
 
         mutable std::mutex m_mutex;
-        // FormatGuid(PlayerUId) -> steam_/gdk_/ps5_…
-        std::unordered_map<std::string, std::string> m_platform_by_uid;
+        std::unordered_map<std::string, RosterEntry> m_roster;
+        std::vector<PendingJoin> m_pending_joins;
         std::vector<RC::Unreal::FGuid> m_xbox;
         std::vector<RC::Unreal::FGuid> m_others;
-        std::unordered_set<std::string> m_online_keys;
-        std::chrono::steady_clock::time_point m_last_refresh{};
-        bool m_have_snapshot = false;
+
+        bool m_registered = false;
+        bool m_bootstrapped = false;
+        std::pair<int, int> m_hook_ids{-1, -1};
     };
 }

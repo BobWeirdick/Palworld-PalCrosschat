@@ -1,0 +1,60 @@
+{
+  "General": {
+    // Which server this instance is: "pal-na" or "pal-eu". Used for DB origin and local prefix.
+    "ServerOrigin": "pal-na",
+    // How often the DB worker polls for inbound cross-server rows (milliseconds).
+    "PollIntervalMs": 750,
+    // Max rows fetched from MySQL per poll.
+    "MaxBatch": 50,
+    // Max BroadcastChatMessage injects per game tick (on_update). Keep low on dedicated servers.
+    "MaxBroadcastsPerTick": 5,
+    // Extra logging (BroadcastDual audience sizes, etc.).
+    "DebugVerbose": false
+  },
+  "MySQL": {
+    // Crosschat database host (shared by NA/EU/Discord bot).
+    "Host": "127.0.0.1",
+    "Port": 3306,
+    "User": "crosschat",
+    "Password": "CHANGE_ME",
+    "Database": "crosschat",
+    // Cap on reconnect delay after MySQL drops (seconds).
+    "ReconnectBackoffMaxSec": 30
+  },
+  "Format": {
+    // Inserted as {prefix} for NA-origin messages.
+    "PrefixNA": "NA",
+    // Inserted as {prefix} for EU-origin messages.
+    "PrefixEU": "EU",
+    // Inserted as {prefix} for Discord-origin messages.
+    "PrefixDiscord": "Discord",
+    // Placeholders: {prefix}, {guild}, {player}, {message}. Applied to injected / tagged chat.
+    "ChatFormat": "[{prefix}][{guild}][{player}: {message}",
+    // Chat category for injects: "global" (1) or "discord" (4).
+    "InjectCategory": "global",
+    // If true, rebroadcast local Global chat with ChatFormat so this server's tag appears.
+    "ShowLocalServerTag": false,
+    // Legacy; dual-broadcast path ignores this. Kept for older configs.
+    "PreserveSenderUId": false,
+    // Legacy (ignored since v1.93). Xbox/Steam split uses join-hook roster + chat Upsert.
+    "EnableAudienceScan": false
+  },
+  "ChatFilter": {
+    // Discord webhook for mute notifications (optional).
+    "LogWebhookUrl": "",
+    // Shown when a player is first muted. {mutetime} = duration text.
+    "InitialMuteNotification": "You have been muted for {mutetime}!",
+    // Shown when a muted player tries to chat. {remainingtime} = time left.
+    "ActiveMuteNotification": "You are muted! Time remaining: {remainingtime}",
+    "FilteredPatterns": [
+      {
+        // ECMAScript regex matched against chat text.
+        "Pattern": "[Mm][Oo][Ii][Ss][Tt]",
+        // Mute length in minutes when this pattern matches.
+        "MuteMinutes": 5,
+        // Private message shown to the muted player.
+        "MuteMessage": "Really? Moist? Disgusting..."
+      }
+    ]
+  }
+}

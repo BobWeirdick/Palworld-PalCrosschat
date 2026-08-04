@@ -228,21 +228,86 @@ namespace PalCrosschat
             if (ProcessEventSeh(&ctx) != 0)
             {
                 Output::send<LogLevel::Error>(
-                    STR("[PalCrosschat] ProcessEvent faulted (BroadcastChatMessage); skipped destroy\n"));
+                    STR("[PalCrosschat] ProcessEvent faulted; skipped destroy\n"));
                 return false;
             }
             return true;
         }
 
-        bool HasWorldObject()
+        // FindFirstOf can AV inside UE4SS GUObjectArray walk (#1328): garbage "object"
+        // pointers that look like UTF-16 text. try/catch does NOT catch those AVs.
+        // Never call FindFirstOf on the hot path without SEH; never FindFirstOf("World")
+        // every tick (mid-session nulls were logged right before prior crashes).
+        struct FindGsCtx
         {
-            try
+            UObject* found = nullptr;
+        };
+
+        int FindGameStateSeh(FindGsCtx* ctx)
+        {
+            __try
             {
-                return UObjectGlobals::FindFirstOf(STR("World")) != nullptr;
+                UObject* found = UObjectGlobals::FindFirstOf(STR("PalGameStateInGame"));
+                if (!found)
+                {
+                    ctx->found = nullptr;
+                    return 0;
+                }
+                // Touch class/vtable — AVs here if FindFirstOf handed back non-UObject memory.
+                if (!found->GetClassPrivate())
+                {
+                    ctx->found = nullptr;
+                    return 0;
+                }
+                volatile void* vtable = *reinterpret_cast<void**>(found);
+                if (!vtable)
+                {
+                    ctx->found = nullptr;
+                    return 0;
+                }
+                ctx->found = found;
+                return 0;
             }
-            catch (...)
+            __except (EXCEPTION_EXECUTE_HANDLER)
             {
-                return false;
+                ctx->found = nullptr;
+                return 1;
+            }
+        }
+
+        struct WeakCacheCtx
+        {
+            FWeakObjectPtr* weak = nullptr;
+            UObject* obj = nullptr;
+            UObject* out = nullptr;
+        };
+
+        int CacheWeakSeh(WeakCacheCtx* ctx)
+        {
+            __try
+            {
+                *ctx->weak = ctx->obj;
+                ctx->out = ctx->weak->Get();
+                return 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                ctx->out = nullptr;
+                return 1;
+            }
+        }
+
+        int WeakGetSeh(WeakCacheCtx* ctx)
+        {
+            __try
+            {
+                ctx->out = ctx->weak->Get();
+                return 0;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                ctx->out = nullptr;
+                return 1;
             }
         }
     }
@@ -277,20 +342,51 @@ namespace PalCrosschat
     UObject* ChatInject::ResolveGameState()
     {
         // FWeakObjectPtr survives GameState teardown; raw cache + GetFullName() AV'd in UE4SS.
-        if (UObject* cached = m_game_state.Get())
         {
-            return cached;
+            WeakCacheCtx get_ctx{};
+            get_ctx.weak = &m_game_state;
+            if (WeakGetSeh(&get_ctx) != 0)
+            {
+                m_game_state.Reset();
+            }
+            else if (get_ctx.out)
+            {
+                return get_ctx.out;
+            }
         }
 
         m_game_state.Reset();
-        UObject* found = UObjectGlobals::FindFirstOf(STR("PalGameStateInGame"));
-        if (!found)
+
+        FindGsCtx find_ctx{};
+        if (FindGameStateSeh(&find_ctx) != 0)
+        {
+            static int s_find_faults = 0;
+            ++s_find_faults;
+            Output::send<LogLevel::Error>(
+                STR("[PalCrosschat] FindFirstOf(PalGameStateInGame) faulted (UE4SS #1328-class)\n"));
+            if (s_find_faults >= 3)
+            {
+                TripInjectCircuit(
+                    STR("FindFirstOf(PalGameStateInGame) faulted repeatedly"));
+            }
+            return nullptr;
+        }
+        if (!find_ctx.found)
         {
             return nullptr;
         }
 
-        m_game_state = found;
-        return m_game_state.Get();
+        WeakCacheCtx cache_ctx{};
+        cache_ctx.weak = &m_game_state;
+        cache_ctx.obj = find_ctx.found;
+        if (CacheWeakSeh(&cache_ctx) != 0 || !cache_ctx.out)
+        {
+            m_game_state.Reset();
+            Output::send<LogLevel::Error>(
+                STR("[PalCrosschat] Rejected PalGameStateInGame candidate (weak cache fault)\n"));
+            return nullptr;
+        }
+        return cache_ctx.out;
     }
 
     bool ChatInject::EnsureBroadcastFunction()
@@ -454,6 +550,11 @@ namespace PalCrosschat
 
         if (!SafeProcessEvent(game_state, m_broadcast_fn, guard.Data()))
         {
+            // Targeted inject failed — drop those uids from roster (likely stale leavers).
+            if (receivers && !receivers->empty() && m_audience)
+            {
+                m_audience->ForgetMany(*receivers);
+            }
             TripInjectCircuit(STR("BroadcastChatMessage ProcessEvent faulted"));
             return true; // consume; circuit prevents retry storm
         }
@@ -633,11 +734,12 @@ namespace PalCrosschat
                                    uint8_t category,
                                    const FGuid* sender_player_uid)
     {
-        // Cache-only — FindAllOf / UniqueNetId run on AudienceTracker::TickRefresh (on_update).
+        // Seed players already online at restart (one-shot). Then snapshot roster.
         std::vector<FGuid> xbox;
         std::vector<FGuid> others;
         if (m_audience)
         {
+            m_audience->TryBootstrapOnce();
             m_audience->Snapshot(xbox, others);
         }
 
@@ -657,15 +759,31 @@ namespace PalCrosschat
                 xbox_uid ? 1 : 0);
         }
 
-        if (xbox.empty())
+        // Empty roster: do NOT BroadcastChatMessage to everyone with nil uid.
+        // That path AVd on EU (1.93 log: xbox=0 others=0 → ProcessEvent fault → crash).
+        if (xbox.empty() && others.empty())
         {
-            // No known Xbox online — one formatted broadcast to everyone (Steam/PC).
-            return BroadcastDisplay(
-                formatted_sender, formatted_message, category, nullptr, nullptr);
+            static auto s_last_empty = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_last_empty > std::chrono::seconds(30))
+            {
+                s_last_empty = now;
+                Output::send<LogLevel::Warning>(
+                    STR("[PalCrosschat] Inject skipped — roster empty (waiting for "
+                        "join/chat/bootstrap). Avoids nil-uid broadcast-to-all crash path.\n"));
+            }
+            return true; // drop; do not requeue forever
         }
 
-        // gdk_ present: formatted+nil to everyone else; attributed+local uid to Xbox.
         bool ok = true;
+        if (xbox.empty())
+        {
+            // Steam/PS5 only online — formatted to known others (not broadcast-to-all).
+            return BroadcastDisplay(
+                formatted_sender, formatted_message, category, &others, nullptr);
+        }
+
+        // gdk_ present: formatted+nil to others; plain (+ local uid when available) to Xbox.
         if (!others.empty())
         {
             ok = BroadcastDisplay(
@@ -678,7 +796,6 @@ namespace PalCrosschat
         }
         else
         {
-            // Cross-server/Discord: nil uid (avoids "------"); Xbox may still mask.
             ok = BroadcastDisplay(xbox_sender, xbox_message, category, &xbox, nullptr) && ok;
         }
         return ok;
@@ -704,6 +821,11 @@ namespace PalCrosschat
 
     bool ChatInject::ShowServerNotice(const std::string& notice_message)
     {
+        if (m_inject_circuit_open)
+        {
+            return true;
+        }
+
         std::string clean = SanitizeNotice(notice_message, 512);
         if (clean.empty())
         {
@@ -715,50 +837,37 @@ namespace PalCrosschat
             return false;
         }
 
+        // Zero-fill only — no InitializeValue/DestroyValue (double-free risk after PE).
         const auto size = m_server_notice_fn->GetParmsSize();
-        std::vector<uint8> buf(size > 0 ? size : sizeof(FString), 0);
-
-        for (FProperty* prop :
-             TFieldRange<FProperty>(m_server_notice_fn, EFieldIterationFlags::IncludeDeprecated))
-        {
-            if (!prop->HasAnyPropertyFlags(CPF_Parm) || prop->HasAnyPropertyFlags(CPF_ReturnParm))
-            {
-                continue;
-            }
-            prop->InitializeValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
-        }
+        auto buf = std::make_unique<uint8[]>(size > 0 ? size : sizeof(FString));
+        std::memset(buf.get(), 0, size > 0 ? size : sizeof(FString));
 
         if (FProperty* msg_prop =
                 m_server_notice_fn->FindProperty(FName(STR("NoticeMessage"), FNAME_Find)))
         {
-            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.data()))
+            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.get()))
             {
                 FillInitFString(msg, clean);
             }
         }
 
         game_state = ResolveGameState();
-        if (game_state)
+        if (!game_state)
         {
-            game_state->ProcessEvent(m_server_notice_fn, buf.data());
+            return false;
         }
-
-        for (FProperty* prop :
-             TFieldRange<FProperty>(m_server_notice_fn, EFieldIterationFlags::IncludeDeprecated))
+        if (!SafeProcessEvent(game_state, m_server_notice_fn, buf.get()))
         {
-            if (!prop->HasAnyPropertyFlags(CPF_Parm))
-            {
-                continue;
-            }
-            prop->DestroyValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
+            TripInjectCircuit(STR("BroadcastServerNotice ProcessEvent faulted"));
+            return true;
         }
-        return game_state != nullptr;
+        return true;
     }
 
     bool ChatInject::SendScreenLog(UObject* player_controller, const std::string& message)
     {
         // Caller must pass a live object (e.g. from FWeakObjectPtr::Get()).
-        if (!player_controller)
+        if (!player_controller || m_inject_circuit_open)
         {
             return false;
         }
@@ -775,50 +884,40 @@ namespace PalCrosschat
             return false;
         }
 
+        // Zero-fill only — no InitializeValue/DestroyValue (double-free risk after PE).
         const auto size = fn->GetParmsSize();
-        std::vector<uint8> buf(size > 0 ? size : 64, 0);
-
-        for (FProperty* prop : TFieldRange<FProperty>(fn, EFieldIterationFlags::IncludeDeprecated))
-        {
-            if (!prop->HasAnyPropertyFlags(CPF_Parm) || prop->HasAnyPropertyFlags(CPF_ReturnParm))
-            {
-                continue;
-            }
-            prop->InitializeValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
-        }
+        const size_t bytes = size > 0 ? static_cast<size_t>(size) : 64;
+        auto buf = std::make_unique<uint8[]>(bytes);
+        std::memset(buf.get(), 0, bytes);
 
         // Best-effort reflected fill: Message, Color (skip / leave default), Duration, Key.
         if (FProperty* msg_prop = fn->FindProperty(FName(STR("Message"), FNAME_Find)))
         {
-            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.data()))
+            if (FString* msg = msg_prop->ContainerPtrToValuePtr<FString>(buf.get()))
             {
                 FillInitFString(msg, clean);
             }
         }
         if (FProperty* dur_prop = fn->FindProperty(FName(STR("Duration"), FNAME_Find)))
         {
-            if (float* dur = dur_prop->ContainerPtrToValuePtr<float>(buf.data()))
+            if (float* dur = dur_prop->ContainerPtrToValuePtr<float>(buf.get()))
             {
                 *dur = 8.0f;
             }
         }
         if (FProperty* key_prop = fn->FindProperty(FName(STR("Key"), FNAME_Find)))
         {
-            if (FName* key = key_prop->ContainerPtrToValuePtr<FName>(buf.data()))
+            if (FName* key = key_prop->ContainerPtrToValuePtr<FName>(buf.get()))
             {
                 *key = FName(STR("PalCrosschatLink"), FNAME_Add);
             }
         }
 
-        player_controller->ProcessEvent(fn, buf.data());
-
-        for (FProperty* prop : TFieldRange<FProperty>(fn, EFieldIterationFlags::IncludeDeprecated))
+        if (!SafeProcessEvent(player_controller, fn, buf.get()))
         {
-            if (!prop->HasAnyPropertyFlags(CPF_Parm))
-            {
-                continue;
-            }
-            prop->DestroyValue(prop->ContainerPtrToValuePtr<void>(buf.data()));
+            Output::send<LogLevel::Warning>(
+                STR("[PalCrosschat] SendScreenLogToClient ProcessEvent faulted; skipped\n"));
+            return false;
         }
         return true;
     }
@@ -886,8 +985,19 @@ namespace PalCrosschat
         {
             return false;
         }
-        if (!HasWorldObject() || !ResolveGameState())
+        // GameState weak/cache only — do NOT FindFirstOf("World") every tick.
+        // That path AVs inside UE4SS (#1328) and logged mid-session "not ready" before crashes.
+        if (!ResolveGameState())
         {
+            static auto s_last_block_log = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_last_block_log > std::chrono::seconds(30))
+            {
+                s_last_block_log = now;
+                Output::send<LogLevel::Warning>(
+                    STR("[PalCrosschat] Inject paused — GameState not ready "
+                        "(cross-server display and local tags deferred)\n"));
+            }
             return false;
         }
 

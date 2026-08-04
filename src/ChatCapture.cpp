@@ -674,9 +674,9 @@ namespace PalCrosschat
                 m_platform_by_player_uid[uid_key] = platform_user_id;
             }
         }
-        if (!platform_user_id.empty() && have_uid && m_audience)
+        if (have_uid && m_audience)
         {
-            m_audience->Remember(player_uid, platform_user_id);
+            m_audience->Upsert(player_uid, platform_user_id, player_state);
         }
 
         std::string platform;
@@ -896,14 +896,12 @@ namespace PalCrosschat
             sender_name = "Unknown";
         }
 
-        // Cache platform for dual-broadcast audience splits (AccountName only — no PE).
+        // Roster Upsert: if they chat but aren't on the join roster, add them now.
+        // Also refreshes platform / weak PlayerState (AccountName only — no PE).
         if (m_audience && !(sender_uid == FGuid{}))
         {
-            if (std::string platform = NormalizePlatformUserId(ReadAccountName(player_state));
-                !platform.empty())
-            {
-                m_audience->Remember(sender_uid, platform);
-            }
+            const std::string platform = NormalizePlatformUserId(ReadAccountName(player_state));
+            m_audience->Upsert(sender_uid, platform, player_state);
         }
         const std::string mute_key = !sender_id.empty() ? sender_id : sender_name;
 

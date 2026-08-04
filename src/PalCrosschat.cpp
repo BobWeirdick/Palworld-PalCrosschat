@@ -21,7 +21,7 @@ public:
     PalCrosschatMod() : CppUserModBase()
     {
         ModName = STR("PalCrosschat");
-        ModVersion = STR("1.90");
+        ModVersion = STR("1.94");
         ModDescription = STR("Relays Palworld chat to MySQL, injects cross-server messages, Discord !setdiscord link");
         ModAuthors = STR("ARKADE");
 
@@ -70,6 +70,10 @@ public:
         {
             m_capture->Unregister();
         }
+        if (m_audience)
+        {
+            m_audience->Unregister();
+        }
         if (m_db)
         {
             m_db->Stop();
@@ -88,11 +92,21 @@ public:
             return;
         }
 
+        if (m_audience)
+        {
+            m_audience->Register();
+        }
         m_capture->Register();
         if (m_config.show_local_server_tag)
         {
             Output::send<LogLevel::Normal>(
                 STR("[PalCrosschat] ShowLocalServerTag=true; local Global chat rebroadcast with prefix\n"));
+        }
+        if (m_config.enable_audience_scan)
+        {
+            Output::send<LogLevel::Normal>(
+                STR("[PalCrosschat] EnableAudienceScan is ignored (v1.93+ uses join roster, "
+                    "not FindAllOf)\n"));
         }
         Output::send<LogLevel::Normal>(
             STR("[PalCrosschat] Unreal ready; cursor={} connected={}\n"),
@@ -113,10 +127,10 @@ public:
             m_capture->FlushDeferred();
         }
 
-        // Optional audience refresh for Xbox dual split (FindAllOf). Off by default (v1.88).
-        if (m_audience && m_config.enable_audience_scan)
+        // Join-hook pending + weak-ptr leave prune (never FindAllOf).
+        if (m_audience)
         {
-            m_audience->TickRefresh();
+            m_audience->Tick();
         }
 
         // Game thread only: private link feedback (screen log), then chat inject.

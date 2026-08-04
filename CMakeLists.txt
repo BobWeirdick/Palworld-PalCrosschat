@@ -96,6 +96,7 @@ target_link_libraries(${TARGET} PRIVATE
 add_dependencies(${TARGET} mariadb_connector_c_ep)
 
 set(DIST_DIR "${CMAKE_SOURCE_DIR}/dist/PalCrosschat")
+set(LINK_DIR "${CMAKE_BINARY_DIR}/link-artifacts/${TARGET}")
 
 set_target_properties(${TARGET} PROPERTIES
     OUTPUT_NAME "main"
@@ -107,21 +108,34 @@ set_target_properties(${TARGET} PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY_DEBUG "${DIST_DIR}/dlls"
     LIBRARY_OUTPUT_DIRECTORY_RELEASE "${DIST_DIR}/dlls"
     LIBRARY_OUTPUT_DIRECTORY_Game__Shipping__Win64 "${DIST_DIR}/dlls"
-    ARCHIVE_OUTPUT_DIRECTORY "${DIST_DIR}/dlls"
-    ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${DIST_DIR}/dlls"
-    ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${DIST_DIR}/dlls"
-    ARCHIVE_OUTPUT_DIRECTORY_Game__Shipping__Win64 "${DIST_DIR}/dlls"
+    # Keep .lib/.exp/.pdb out of dist/dlls (ship DLL only).
+    ARCHIVE_OUTPUT_DIRECTORY "${LINK_DIR}"
+    ARCHIVE_OUTPUT_DIRECTORY_DEBUG "${LINK_DIR}"
+    ARCHIVE_OUTPUT_DIRECTORY_RELEASE "${LINK_DIR}"
+    ARCHIVE_OUTPUT_DIRECTORY_Game__Shipping__Win64 "${LINK_DIR}"
+    PDB_OUTPUT_DIRECTORY "${LINK_DIR}"
+    PDB_OUTPUT_DIRECTORY_DEBUG "${LINK_DIR}"
+    PDB_OUTPUT_DIRECTORY_RELEASE "${LINK_DIR}"
+    PDB_OUTPUT_DIRECTORY_Game__Shipping__Win64 "${LINK_DIR}"
+    COMPILE_PDB_OUTPUT_DIRECTORY "${LINK_DIR}"
 )
 
 add_custom_command(TARGET ${TARGET} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory "${DIST_DIR}/dlls"
+    COMMAND ${CMAKE_COMMAND} -E rm -f
+        "${DIST_DIR}/dlls/main.exp"
+        "${DIST_DIR}/dlls/main.lib"
+        "${DIST_DIR}/dlls/main.pdb"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_SOURCE_DIR}/config/config.json.example"
-        "${DIST_DIR}/config.json.example"
+        "${CMAKE_SOURCE_DIR}/config/config-example.json"
+        "${DIST_DIR}/config-example.json"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_SOURCE_DIR}/config/config-commented.json"
+        "${DIST_DIR}/config-commented.json"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/dist/PalCrosschat/enabled.txt"
         "${DIST_DIR}/enabled.txt"
-    COMMENT "Packaging PalCrosschat into dist/PalCrosschat"
+    COMMENT "Packaging PalCrosschat into dist/PalCrosschat (DLL + configs only)"
 )
 
 # Optional: install into a live PalServer Mods tree.
@@ -131,9 +145,16 @@ if(DEFINED PALSERVER_MODS_DIR AND NOT "${PALSERVER_MODS_DIR}" STREQUAL "")
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             $<TARGET_FILE:${TARGET}>
             "${PALSERVER_MODS_DIR}/PalCrosschat/dlls/main.dll"
+        COMMAND ${CMAKE_COMMAND} -E rm -f
+            "${PALSERVER_MODS_DIR}/PalCrosschat/dlls/main.exp"
+            "${PALSERVER_MODS_DIR}/PalCrosschat/dlls/main.lib"
+            "${PALSERVER_MODS_DIR}/PalCrosschat/dlls/main.pdb"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_SOURCE_DIR}/config/config.json.example"
-            "${PALSERVER_MODS_DIR}/PalCrosschat/config.json.example"
+            "${CMAKE_SOURCE_DIR}/config/config-example.json"
+            "${PALSERVER_MODS_DIR}/PalCrosschat/config-example.json"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/config/config-commented.json"
+            "${PALSERVER_MODS_DIR}/PalCrosschat/config-commented.json"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/dist/PalCrosschat/enabled.txt"
             "${PALSERVER_MODS_DIR}/PalCrosschat/enabled.txt"

@@ -1,0 +1,39 @@
+{
+  "General": {
+    "ServerOrigin": "pal-na",
+    "PollIntervalMs": 750,
+    "MaxBatch": 50,
+    "MaxBroadcastsPerTick": 5,
+    "DebugVerbose": false
+  },
+  "MySQL": {
+    "Host": "127.0.0.1",
+    "Port": 3306,
+    "User": "crosschat",
+    "Password": "CHANGE_ME",
+    "Database": "crosschat",
+    "ReconnectBackoffMaxSec": 30
+  },
+  "Format": {
+    "PrefixNA": "NA",
+    "PrefixEU": "EU",
+    "PrefixDiscord": "Discord",
+    "ChatFormat": "[{prefix}][{guild}][{player}: {message}",
+    "InjectCategory": "global",
+    "ShowLocalServerTag": false,
+    "PreserveSenderUId": false,
+    "EnableAudienceScan": false
+  },
+  "ChatFilter": {
+    "LogWebhookUrl": "",
+    "InitialMuteNotification": "You have been muted for {mutetime}!",
+    "ActiveMuteNotification": "You are muted! Time remaining: {remainingtime}",
+    "FilteredPatterns": [
+      {
+        "Pattern": "[Mm][Oo][Ii][Ss][Tt]",
+        "MuteMinutes": 5,
+        "MuteMessage": "Really? Moist? Disgusting..."
+      }
+    ]
+  }
+}
