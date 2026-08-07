@@ -145,31 +145,55 @@ servers and Discord, so global is the only channel ever written there.
 With `DebugVerbose`, each chat line logs `CHAT pal_cat=… relayed=…`, which is the
 quickest way to confirm what channel the server actually saw for a given message.
 
-### Xbox / console dual broadcast (v1.79+, v1.86)
+### Xbox / console dual broadcast (v1.79+, v1.86, v1.95)
 
-Custom `ChatFormat` Sender tags require a nil `SenderPlayerUId`; Xbox clients mask
-chat bodies they cannot attribute. Injected/rebroadcast lines split via
-`ReceiverPlayerUIds`:
+Custom `ChatFormat` Sender tags require a nil `SenderPlayerUId`; Xbox's own client-side
+chat-safety system masks any chat body it cannot attribute to a real, currently
+connected session member — this is a Microsoft/GDK behavior, not something this mod
+controls. Injected/rebroadcast lines split via `ReceiverPlayerUIds`:
 
-- **steam_ / ps5_ / unknown** — formatted Sender tags (`[EU][WOWZERS][Name]: hello`, nil uid).
+- **steam_ / ps5_ / unknown** — formatted Sender tags (`[EU][WOWZERS][Name]: hello`, nil
+  uid), for same-server, cross-server, and Discord messages alike.
 - **gdk_ only** — plain native chat (`[Name]: hello`) with a **local** sender
-  `PlayerUId` (no `[NA]` / guild tags).
+  `PlayerUId` (no `[NA]` / guild tags), and **same-server chat only** (v1.95+).
 
-Audience splits are optional (`EnableAudienceScan`, default **false** in v1.88 — the
-EU crash log never showed `xbox>0` but still ran `FindAllOf` every few seconds).
-When enabled: ~3s refresh, `AccountName` / chat-hook `Remember` only. Inject is
-live-only (cursor → `MAX(id)` on connect), warm-up gated, and fills broadcast
-FStrings via game `GMalloc` (no UE4SS `FString` assign/Append; no `DestroyStruct`
-after a successful `ProcessEvent`).
+Remote/cross-server UIDs are never set as `SenderPlayerUId` (an earlier attempt at this
+rendered `------` instead, since Unreal can't resolve a PlayerState for a GUID that
+isn't part of the current session). Without a real local uid the message would instead
+broadcast to Xbox with a nil uid and get masked to `***` — so as of v1.95, cross-server
+and Discord messages (which can never carry a real local `PlayerUId`) are simply **not
+sent to Xbox players at all**, rather than shown censored. Xbox players only see chat
+from players on their own server; Steam/PS5/PC players continue to see everything
+(same-server, cross-server, and Discord) formatted as before. If you want Xbox to have
+crosschat visibility, the workaround must happen off this mod's networking path (e.g. a
+separate overlay/notification channel) — there's no way to spoof session attribution
+that Xbox's client will accept.
+
+Audience roster (who's online, and who's on gdk_) comes from a join hook + weak-pointer
+prune (v1.93+), not periodic `FindAllOf` — see "Threading model" and the SEH notes
+below for why that mattered for crash stability, not just performance.
 
 `ChatFormat` may omit a trailing `]` after `{player}` if you rely on Palworld’s
 native closer (e.g. `[{prefix}][{guild}][{player}: {message}`).
 
-Remote/cross-server UIDs are never set as `SenderPlayerUId` (avoids `------`).
-Discord → game rows have no Palworld `PlayerUId`, so Xbox may still mask those.
-
 `ChatFormat` is split on the `{message}` placeholder before substitution, so
 trailing template junk cannot leave the chat text in the Sender field and double it.
+
+### Crash hardening: SEH around ProcessEvent / FWeakObjectPtr::Get() (v1.95)
+
+Two Unreal operations have caused this process to hard-crash in the past:
+`UObject::ProcessEvent` and `FWeakObjectPtr::Get()`. Both are wrapped in structured
+exception handling (`__try`/`__except`) via `src/SehUtil.h` (`SafeProcessEvent` /
+`SafeWeakGet`) — **plain C++ `try`/`catch` does not catch these**, they are hardware
+access violations, not C++ exceptions, and UE4SS's own mod-tick loop
+(`UE4SSProgram.cpp`, `mod->fire_update()`) has no exception handling around it either.
+Any call to these two operations that isn't routed through the shared helpers is a
+silent full-process-crash risk with no PalCrosschat log line to explain it. Notably,
+`ResolvePlayerNameViaPE`'s `GetPlayerName` call runs on nearly every chat line (dedicated
+servers usually leave the `PlayerName` property empty), so it and the deferred-queue
+`FWeakObjectPtr::Get()` calls in `ChatCapture`/`ChatInject` were the highest-frequency
+unprotected fault points before v1.95. Any new code touching either operation must go
+through `SafeProcessEvent`/`SafeWeakGet`, not call them directly.
 
 ### Command handling
 

@@ -2,6 +2,7 @@
 #include "ChatFormat.h"
 #include "PalChatApi.h"
 #include "Sanitize.h"
+#include "SehUtil.h"
 #include "WordFilter.h"
 
 #include <bit>
@@ -198,42 +199,6 @@ namespace PalCrosschat
             }
         }
 
-        struct PeCtx
-        {
-            UObject* obj = nullptr;
-            UFunction* fn = nullptr;
-            void* params = nullptr;
-        };
-
-        int ProcessEventSeh(PeCtx* ctx)
-        {
-            __try
-            {
-                ctx->obj->ProcessEvent(ctx->fn, ctx->params);
-                return 0;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                return 1;
-            }
-        }
-
-        bool SafeProcessEvent(UObject* obj, UFunction* fn, void* params)
-        {
-            if (!obj || !fn || !params)
-            {
-                return false;
-            }
-            PeCtx ctx{obj, fn, params};
-            if (ProcessEventSeh(&ctx) != 0)
-            {
-                Output::send<LogLevel::Error>(
-                    STR("[PalCrosschat] ProcessEvent faulted; skipped destroy\n"));
-                return false;
-            }
-            return true;
-        }
-
         // FindFirstOf can AV inside UE4SS GUObjectArray walk (#1328): garbage "object"
         // pointers that look like UTF-16 text. try/catch does NOT catch those AVs.
         // Never call FindFirstOf on the hot path without SEH; never FindFirstOf("World")
@@ -297,19 +262,6 @@ namespace PalCrosschat
             }
         }
 
-        int WeakGetSeh(WeakCacheCtx* ctx)
-        {
-            __try
-            {
-                ctx->out = ctx->weak->Get();
-                return 0;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                ctx->out = nullptr;
-                return 1;
-            }
-        }
     }
 
     ChatInject::ChatInject(const Config& config, WordFilter* filter, AudienceTracker* audience)
@@ -342,17 +294,9 @@ namespace PalCrosschat
     UObject* ChatInject::ResolveGameState()
     {
         // FWeakObjectPtr survives GameState teardown; raw cache + GetFullName() AV'd in UE4SS.
+        if (UObject* cached = SafeWeakGet(m_game_state))
         {
-            WeakCacheCtx get_ctx{};
-            get_ctx.weak = &m_game_state;
-            if (WeakGetSeh(&get_ctx) != 0)
-            {
-                m_game_state.Reset();
-            }
-            else if (get_ctx.out)
-            {
-                return get_ctx.out;
-            }
+            return cached;
         }
 
         m_game_state.Reset();
@@ -668,7 +612,7 @@ namespace PalCrosschat
                 ShowServerNotice(action.message);
                 break;
             case DeferredKind::ScreenLog:
-                if (UObject* controller = action.controller.Get())
+                if (UObject* controller = SafeWeakGet(action.controller))
                 {
                     SendScreenLog(controller, action.message);
                 }
@@ -783,20 +727,22 @@ namespace PalCrosschat
                 formatted_sender, formatted_message, category, &others, nullptr);
         }
 
-        // gdk_ present: formatted+nil to others; plain (+ local uid when available) to Xbox.
+        // gdk_ present: formatted+nil always goes to others.
         if (!others.empty())
         {
             ok = BroadcastDisplay(
                      formatted_sender, formatted_message, category, &others, nullptr) &&
                  ok;
         }
+
+        // Xbox only ever receives plain native chat attributed to a real, locally
+        // connected SenderPlayerUId (i.e. same-server chat from a player currently on
+        // this server). A nil uid gets masked to '***' by Xbox's own chat-safety system,
+        // and cross-server / Discord senders can never carry a real local uid — so those
+        // are simply not sent to Xbox at all rather than shown censored.
         if (xbox_uid)
         {
             ok = BroadcastDisplay(xbox_sender, xbox_message, category, &xbox, xbox_uid) && ok;
-        }
-        else
-        {
-            ok = BroadcastDisplay(xbox_sender, xbox_message, category, &xbox, nullptr) && ok;
         }
         return ok;
     }

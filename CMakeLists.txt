@@ -25,6 +25,7 @@ ExternalProject_Add(mariadb_connector_c_ep
         -DWITH_MYSQLCOMPAT=OFF
         -DWITH_SSL=SCHANNEL
         -DCMAKE_COMPILE_WARNING_AS_ERROR=OFF
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5
         -DCLIENT_PLUGIN_CACHING_SHA2_PASSWORD=STATIC
         -DCLIENT_PLUGIN_MYSQL_NATIVE_PASSWORD=STATIC
         -DCLIENT_PLUGIN_SHA256_PASSWORD=STATIC
@@ -62,6 +63,7 @@ add_library(${TARGET} SHARED
     src/PalCrosschat.cpp
     src/Config.cpp
     src/Sanitize.cpp
+    src/SehUtil.cpp
     src/DbWorker.cpp
     src/Audience.cpp
     src/PlatformId.cpp

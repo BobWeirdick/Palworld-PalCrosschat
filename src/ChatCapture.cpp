@@ -3,6 +3,7 @@
 #include "PalChatApi.h"
 #include "PlatformId.h"
 #include "Sanitize.h"
+#include "SehUtil.h"
 
 #include <cctype>
 #include <chrono>
@@ -105,6 +106,10 @@ namespace PalCrosschat
 
         // GetPlayerName ProcessEvent — call only outside EnterChat_Receive (on_update /
         // FlushDeferred). Nested PE in that hook AVs UE4SS on dedicated servers.
+        // ProcessEvent itself goes through SafeProcessEvent (SEH): this runs on nearly
+        // every chat line (dedicated servers usually leave PlayerName empty), so an
+        // unguarded fault here would take the whole process down via on_update, which
+        // UE4SS calls with no exception handling of its own.
         std::string ResolvePlayerNameViaPE(UObject* player_state)
         {
             if (!player_state)
@@ -116,13 +121,20 @@ namespace PalCrosschat
             {
                 const auto size = fn->GetParmsSize();
                 std::vector<uint8> buf(size > 0 ? size : sizeof(FString), 0);
-                player_state->ProcessEvent(fn, buf.data());
-                if (FProperty* ret = fn->GetReturnProperty())
+                if (SafeProcessEvent(player_state, fn, buf.data()))
                 {
-                    if (FString* name = ret->ContainerPtrToValuePtr<FString>(buf.data()))
+                    if (FProperty* ret = fn->GetReturnProperty())
                     {
-                        return FStringToUtf8(*name);
+                        if (FString* name = ret->ContainerPtrToValuePtr<FString>(buf.data()))
+                        {
+                            return FStringToUtf8(*name);
+                        }
                     }
+                }
+                else
+                {
+                    Output::send<LogLevel::Warning>(
+                        STR("[PalCrosschat] GetPlayerName ProcessEvent faulted; skipped\n"));
                 }
             }
 
@@ -747,7 +759,7 @@ namespace PalCrosschat
         {
             m_inject->EnqueuePrivateChat(client.player_uid, result.notice);
         }
-        else if (UObject* controller = client.controller.Get())
+        else if (UObject* controller = SafeWeakGet(client.controller))
         {
             Output::send<LogLevel::Warning>(
                 STR("[PalCrosschat] Link feedback: no PlayerUId; falling back to screen log\n"));
@@ -770,7 +782,7 @@ namespace PalCrosschat
                 m_pending_chat_relays.pop_front();
             }
 
-            UObject* controller = pending.controller.Get();
+            UObject* controller = SafeWeakGet(pending.controller);
             UObject* player_state = GetPlayerState(controller);
             std::string sender_name = SanitizeMessage(ResolvePlayerNameViaPE(player_state), 64);
             if (sender_name.empty())
@@ -819,7 +831,7 @@ namespace PalCrosschat
                 m_pending_setdiscord.pop_front();
             }
 
-            if (UObject* controller = pending.controller.Get())
+            if (UObject* controller = SafeWeakGet(pending.controller))
             {
                 ProcessSetDiscord(controller, pending.connect_code);
             }

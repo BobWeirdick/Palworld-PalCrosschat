@@ -1,5 +1,6 @@
 #include "Audience.h"
 #include "PlatformId.h"
+#include "SehUtil.h"
 
 #include <cstdio>
 #include <string>
@@ -47,38 +48,6 @@ namespace PalCrosschat
         bool IsXboxPlatform(const std::string& platform_user_id)
         {
             return platform_user_id.rfind("gdk_", 0) == 0;
-        }
-
-        struct WeakGetCtx
-        {
-            FWeakObjectPtr* weak = nullptr;
-            UObject* out = nullptr;
-        };
-
-        int WeakGetSeh(WeakGetCtx* ctx)
-        {
-            __try
-            {
-                ctx->out = ctx->weak->Get();
-                return 0;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                ctx->out = nullptr;
-                return 1;
-            }
-        }
-
-        UObject* SafeWeakGet(FWeakObjectPtr& weak)
-        {
-            WeakGetCtx ctx{};
-            ctx.weak = &weak;
-            if (WeakGetSeh(&ctx) != 0)
-            {
-                weak.Reset();
-                return nullptr;
-            }
-            return ctx.out;
         }
 
         struct ReadIdCtx
